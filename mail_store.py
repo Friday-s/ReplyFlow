@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any
 
 
-APP_DATA_DIR = Path.home() / ".replydesk"
+# Data dir: ~/.replyflow; keep using legacy ~/.replydesk if it already has data.
+_NEW_DIR = Path.home() / ".replyflow"
+_OLD_DIR = Path.home() / ".replydesk"
+APP_DATA_DIR = _OLD_DIR if (_OLD_DIR.exists() and not _NEW_DIR.exists()) else _NEW_DIR
 MAIL_STORE_PATH = APP_DATA_DIR / "mail_store.sqlite3"
 
 

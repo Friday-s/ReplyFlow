@@ -41,7 +41,8 @@ _mail_store = MailStore()
 
 INTERNAL_DOMAINS = tuple(
     d.strip().lower()
-    for d in os.getenv("REPLYDESK_INTERNAL_DOMAINS", "@bloome.im").split(",")
+    for d in (os.getenv("REPLYFLOW_INTERNAL_DOMAINS")
+              or os.getenv("REPLYDESK_INTERNAL_DOMAINS", "")).split(",")
     if d.strip()
 )
 EXCLUDE_FROM     = ("mailer-daemon", "noreply", "no-reply")
@@ -800,9 +801,9 @@ def _translate_chain_blocks(texts: list) -> list:
                     out[i] = ""
     return out
 
-# ── 回复生成引擎：DeepSeek 优先（HTTP，~2-5s），失败回退本机 claude CLI ─────────
-# ⚠️ key 存 vault 外（~/.bloome-deepseek.key，chmod 600）——本文件随 vault 推 GitHub，
-#    绝不能把任何密钥写进代码。
+# ── Reply engine: DeepSeek first (HTTP, ~2-5s), fall back to local `claude` CLI ──
+# Key is read from a local file (chmod 600), never hardcoded in source.
+#   primary:  ~/.replyflow/deepseek.key   legacy fallback: ~/.bloome-deepseek.key
 DEEPSEEK_KEY_FILE = APP_DATA_DIR / "deepseek.key"
 LEGACY_DEEPSEEK_KEY_FILE = Path.home() / ".bloome-deepseek.key"
 

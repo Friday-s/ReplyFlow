@@ -1,4 +1,4 @@
-# ReplyDesk
+# ReplyFlow
 
 Independent local WebUI for Feishu mail reply triage, AI drafting, review queues, and CRM updates.
 
@@ -17,19 +17,20 @@ Open http://localhost:5050.
 ## Runtime Config
 
 Set these locally before starting the app. Do not commit real values.
+(Legacy `REPLYDESK_*` names are still accepted as a fallback.)
 
 ```bash
-export REPLYDESK_BASE_TOKEN="your-feishu-base-token"
-export REPLYDESK_TABLE_ID="your-feishu-table-id"
-export REPLYDESK_FROM_ADDRESS="you@example.com"
-export REPLYDESK_INTERNAL_DOMAINS="@your-company.com,@your-product.com"
-export REPLYDESK_BLOOME_IMG="$HOME/Downloads/bloome.png"
-export REPLYDESK_INBOX_LIMIT="200"
+export REPLYFLOW_BASE_TOKEN="your-feishu-base-token"
+export REPLYFLOW_TABLE_ID="your-feishu-table-id"
+export REPLYFLOW_FROM_ADDRESS="you@example.com"
+export REPLYFLOW_INTERNAL_DOMAINS="@your-company.com,@your-product.com"
+export REPLYFLOW_BLOOME_IMG="$HOME/Downloads/promo-image.png"
+export REPLYFLOW_INBOX_LIMIT="200"
 ```
 
 DeepSeek key lookup:
 
-1. `~/.replydesk/deepseek.key`
+1. `~/.replyflow/deepseek.key`
 2. legacy fallback: `~/.bloome-deepseek.key`
 
 ## Local Mail Storage
@@ -37,8 +38,10 @@ DeepSeek key lookup:
 Mail metadata, fetched thread bodies, generated drafts, and approved drafts are stored locally in:
 
 ```text
-~/.replydesk/mail_store.sqlite3
+~/.replyflow/mail_store.sqlite3
 ```
+
+(If you already have data under `~/.replydesk`, ReplyFlow keeps using it.)
 
 Useful local-store endpoints:
 

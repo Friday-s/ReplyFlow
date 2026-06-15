@@ -1,13 +1,20 @@
 """
-博主外联助手 — 核心业务逻辑
-供 app.py (Streamlit) 和 run.py (CLI) 共用
+ReplyFlow — core business logic shared by the WebUI.
+Local Feishu mail reply triage, AI drafting, review queue, CRM updates.
 """
 
 import subprocess, json, re, os, tempfile, time, shutil
 from pathlib import Path
 from datetime import datetime
 
-APP_DATA_DIR = Path.home() / ".replydesk"
+def _cfg(name: str, default: str = "") -> str:
+    """Read config: REPLYFLOW_<name> preferred, legacy REPLYDESK_<name> as fallback."""
+    return os.getenv("REPLYFLOW_" + name) or os.getenv("REPLYDESK_" + name) or default
+
+# Data dir: ~/.replyflow; keep using legacy ~/.replydesk if it already has data.
+_NEW_DIR = Path.home() / ".replyflow"
+_OLD_DIR = Path.home() / ".replydesk"
+APP_DATA_DIR = _OLD_DIR if (_OLD_DIR.exists() and not _NEW_DIR.exists()) else _NEW_DIR
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPO_CACHE_FILE = APP_DATA_DIR / "repo-cache.json"
 REPO_CACHE_TTL  = 86400   # 24 小时
@@ -30,14 +37,14 @@ def _save_repo_disk_cache(cache: dict):
         pass
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BASE_TOKEN   = os.getenv("REPLYDESK_BASE_TOKEN", "")
-TABLE_ID     = os.getenv("REPLYDESK_TABLE_ID", "")
-FROM_ADDRESS = os.getenv("REPLYDESK_FROM_ADDRESS", "")
-VAULT_ROOT   = Path(os.getenv("REPLYDESK_VAULT_ROOT", str(Path.cwd())))
-BLOOME_IMG   = Path(os.getenv("REPLYDESK_BLOOME_IMG", str(Path.home() / "Downloads/bloome.png")))
-INBOX_LIMIT  = int(os.getenv("REPLYDESK_INBOX_LIMIT", "200"))
+BASE_TOKEN   = _cfg("BASE_TOKEN")
+TABLE_ID     = _cfg("TABLE_ID")
+FROM_ADDRESS = _cfg("FROM_ADDRESS")
+VAULT_ROOT   = Path(_cfg("VAULT_ROOT", str(Path.cwd())))
+BLOOME_IMG   = Path(_cfg("BLOOME_IMG", str(Path.home() / "Downloads/bloome.png")))
+INBOX_LIMIT  = int(_cfg("INBOX_LIMIT", "200"))
 INTERNAL_DOMAINS = tuple(
-    d.strip().lower() for d in os.getenv("REPLYDESK_INTERNAL_DOMAINS", "").split(",") if d.strip()
+    d.strip().lower() for d in _cfg("INTERNAL_DOMAINS").split(",") if d.strip()
 )
 
 BLOOME_TOPICS = {
