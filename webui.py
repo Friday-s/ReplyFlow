@@ -61,6 +61,7 @@ def load_state() -> dict:
     raw.setdefault("history", {})
     raw.setdefault("legacy", {})
     raw.setdefault("farewell", {})   # email → 告别信发出时间（不合适博主的礼貌收尾）
+    raw.setdefault("bounces", {})    # 已处理过的退信 message_id → 时间戳（防重复置「无法合作」）
     return raw
 
 def save_state(state: dict):
@@ -256,6 +257,11 @@ def _build_inbox():
     cutoff   = datetime.now(timezone.utc) - timedelta(days=7)
     state    = load_state()
     state_dirty = False
+    # 退信处理：把发不到的博主在 Base 里置「无法合作」（在按人归并前，因退信发件人会被 EXCLUDE_FROM 滤掉）
+    try:
+        _process_bounces(messages, email_map, state)
+    except Exception as e:
+        print(f"[bounce] 处理失败: {e}")
     # 按"人"归并：QQ 等邮箱的回信经常不进同一 thread（每封自成线程），
     # 所以先把同一发件人的全部消息聚起来：最新一封做列表入口，全部 thread_id 留作完整对话源。
     by_email, email_threads = {}, {}
@@ -394,6 +400,60 @@ def update_feishu_status(record_id: str, new_status: str) -> bool:
 
 def update_feishu_note(record_id: str, note: str) -> bool:
     return _feishu_patch(record_id, {"备注（报价、合作形式等）": note})
+
+# ── 退信处理：识别退信 → 解析失败收件人 → 对应记录置「无法合作」 ───────────────────
+_BOUNCE_FROM = ("mailer-daemon", "postmaster", "mail-daemon", "mail delivery",
+                "maildelivery", "mailerdaemon")
+_BOUNCE_SUBJ = re.compile(
+    r"(undeliver|delivery status notification|mail delivery (?:failed|subsystem)|"
+    r"returned mail|delivery (?:has )?failed|failure notice|delivery incomplete|"
+    r"address not found|退信|配信不可|無法投遞|无法投递|送信できません)", re.I)
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+def _is_bounce(msg: dict) -> bool:
+    fr = (msg.get("from") or "").lower()
+    if any(x in fr for x in _BOUNCE_FROM):
+        return True
+    return bool(_BOUNCE_SUBJ.search(msg.get("subject") or ""))
+
+def _process_bounces(messages: list, email_map: dict, state: dict) -> dict:
+    """扫退信邮件：从退信正文里找回失败的收件人邮箱，匹配 Base 记录 → 联系状态置「无法合作」。
+    返回本轮命中的 {email: record_id}。已处理的退信记进 state['bounces'] 防重复。"""
+    done = state.setdefault("bounces", {})
+    lower_map = {e.lower(): (e, rec) for e, rec in email_map.items() if e}
+    hits, touched = {}, False
+    for msg in messages:
+        mid = msg.get("message_id")
+        if not mid or mid in done or not _is_bounce(msg):
+            continue
+        # 只解析退信这一条消息自己的正文：群发同主题共享 thread_id（一个线程混几十个博主），
+        # 若整线程抓邮箱会把没退信的人也误置「无法合作」。按 message_id 精确取退信那一条。
+        own_body = ""
+        try:
+            for m in (_get_thread(msg.get("thread_id")) or []):
+                if m.get("message_id") == mid:
+                    own_body = m.get("body_plain_text") or ""
+                    break
+        except Exception:
+            pass
+        found = {e.lower() for e in _EMAIL_RE.findall(own_body)}
+        found.discard(FROM_ADDRESS.lower())   # 排除自己（发件人）
+        for fe in found:
+            if fe in lower_map:
+                orig_email, rec = lower_map[fe]
+                rid = rec.get("_record_id")
+                cur = rec.get("联系状态") or ""
+                if rid and "无法合作" not in cur and "不合适" not in cur:
+                    if update_feishu_status(rid, "无法合作"):
+                        hits[orig_email] = rid
+                        rec["联系状态"] = '["无法合作"]'   # 同步本地缓存，rebuild 也会再读
+        done[mid] = int(time.time())   # 不论是否匹配都标记，避免每次重建反复抓正文
+        touched = True
+    if touched:
+        save_state(state)
+    if hits:
+        print(f"[bounce] 退信置「无法合作」{len(hits)} 个：{list(hits)}")
+    return hits
 
 # ── 模板预生成 ────────────────────────────────────────────────────────────────
 def _gen_previews_for(item: dict):
@@ -1409,6 +1469,37 @@ def api_preview():
         text = preview_generic_text_zh(name) if zh else preview_generic_text(name)
     return jsonify({"ok": True, "text": text})
 
+def _status_text(raw) -> str:
+    """联系状态原始值 '["沟通中"]' / '沟通中' → '沟通中'；空 → '（未填）'。"""
+    if not raw:
+        return "（未填）"
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            return (str(v[0]) if v else "（未填）")
+        return str(v)
+    except Exception:
+        return str(raw).strip().strip('[]"') or "（未填）"
+
+@app.route("/api/stats")
+def api_stats():
+    """完整统计：读全量 Base 记录，按联系状态分类计数（不受收件箱 7 天限制）。"""
+    try:
+        records = get_all_records()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:160]})
+    counts, total = {}, 0
+    for r in records:
+        if not r.get("_email"):
+            continue   # 只统计有联系方式（邮箱）的博主行
+        total += 1
+        st = _status_text(r.get("联系状态"))
+        counts[st] = counts.get(st, 0) + 1
+    order = FEISHU_STATUS_OPTIONS + ["已上线", "（未填）"]
+    ordered = [{"status": s, "count": counts.pop(s)} for s in order if s in counts]
+    ordered += [{"status": s, "count": c} for s, c in counts.items()]   # 兜底：顺序外的状态
+    return jsonify({"ok": True, "total": total, "counts": ordered})
+
 REPLY_IMG_DIR = Path.home() / ".bloome-reply-images"   # 用户随回复上传的图片（数据目录外，不入库）
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
@@ -2096,6 +2187,7 @@ body.resizing{user-select:none;cursor:col-resize}
     <div class="sb-tools">
       <span id="sync-info"></span>
       <span style="margin-left:auto;display:inline-flex;gap:6px">
+        <button class="icon-btn" onclick="openStats()" title="按联系状态完整统计（读飞书全表）">📊</button>
         <button class="icon-btn" onclick="openSettings()" title="设置：改 AI 提示词 / 看回复评分">⚙️</button>
         <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="切换主题">🌙</button>
         <button class="icon-btn" onclick="loadReplies(true)" title="刷新（含飞书已发送同步）"><span id="ri">⟳</span></button>
@@ -2234,6 +2326,20 @@ body.resizing{user-select:none;cursor:col-resize}
       </span>
     </div>
     <div class="modal-body" id="settings-body"></div>
+  </div>
+</div>
+
+<div class="modal-mask" id="stats-mask" onclick="if(event.target===this)closeStats()">
+  <div class="modal-box" style="width:min(460px,94vw)">
+    <div class="modal-head">
+      <b style="font-size:14px">📊 联系状态统计</b>
+      <span id="stats-total" style="color:var(--text-3);font-size:12px"></span>
+      <span style="margin-left:auto;display:inline-flex;gap:7px">
+        <button class="btn btn-soft btn-sm" onclick="openStats()" title="重新读飞书全表">🔄 刷新</button>
+        <button class="btn btn-soft btn-sm" onclick="closeStats()">✕ 关闭</button>
+      </span>
+    </div>
+    <div class="modal-body" id="stats-body"></div>
   </div>
 </div>
 
@@ -3156,6 +3262,33 @@ async function openSettings(){
   switchSettingsTab(_settingsTab);
 }
 function closeSettings(){ document.getElementById('settings-mask').classList.remove('show'); }
+
+const STATUS_COLORS = {'待联系':'#8a8f99','已联系':'#3aa3cf','沟通中':'#46b58a','达成合作':'#5fae5f',
+  '推进制作':'#9a6de0','已上线':'#46b58a','待定':'#c79a3e','需审核':'#d8618c',
+  '无法合作':'#cf736a','不合适':'#cf736a','（未填）':'#6b7280'};
+async function openStats(){
+  const mask=document.getElementById('stats-mask'), body=document.getElementById('stats-body');
+  mask.classList.add('show');
+  document.getElementById('stats-total').textContent='';
+  body.innerHTML='<p class="empty">⟳ 正在读飞书全表统计…</p>';
+  try{
+    const r=await fetch('/api/stats'); const d=await r.json();
+    if(!d.ok){ body.innerHTML='<p class="empty">统计失败：'+escHTML(d.error||'')+'</p>'; return; }
+    document.getElementById('stats-total').textContent='共 '+d.total+' 位博主';
+    const max=Math.max(1,...d.counts.map(c=>c.count));
+    body.innerHTML = d.counts.map(c=>{
+      const col=STATUS_COLORS[c.status]||'#6b7280';
+      const pct=Math.round(c.count/max*100);
+      return `<div style="display:flex;align-items:center;gap:10px;margin:7px 0">
+        <span style="flex:0 0 84px;font-size:12.5px;color:var(--text)">${escHTML(c.status)}</span>
+        <span style="flex:1;height:18px;background:var(--bg-2);border-radius:5px;overflow:hidden">
+          <span style="display:block;height:100%;width:${pct}%;background:${col};border-radius:5px"></span></span>
+        <b style="flex:0 0 38px;text-align:right;font-size:12.5px;color:var(--text)">${c.count}</b>
+      </div>`;
+    }).join('') || '<p class="empty">无数据</p>';
+  }catch(e){ body.innerHTML='<p class="empty">统计失败</p>'; }
+}
+function closeStats(){ document.getElementById('stats-mask').classList.remove('show'); }
 function switchSettingsTab(tab){
   _settingsTab = tab;
   document.getElementById('tab-prompts').classList.toggle('active', tab==='prompts');
