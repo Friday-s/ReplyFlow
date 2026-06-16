@@ -5,7 +5,6 @@ Independent local WebUI for Feishu mail reply triage, AI drafting, review queues
 ## Run
 
 ```bash
-cd replydesk
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt

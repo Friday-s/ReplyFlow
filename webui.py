@@ -1008,6 +1008,33 @@ def api_replies():
                     "send_mode": _send_state["mode"], "auto_sync": _auto_sync,
                     "refreshing": _reload_lock["running"]})
 
+@app.route("/api/search")
+def api_search():
+    """按内容搜博主：在已缓存的完整往来正文里找 q，返回命中的 message_id 列表。
+    依赖线程缓存（预热后全量在内存）；没缓存到的线程会跳过（前端仍有本地字段匹配兜底）。"""
+    q = (request.args.get("q") or "").strip().lower()
+    if not q:
+        return jsonify({"ok": True, "q": q, "mids": []})
+    inbox = _cache.get("inbox") or []
+    et = _cache.get("email_threads") or {}
+    mids = []
+    for it in inbox:
+        email = it.get("email", "")
+        blob = " ".join([it.get("subject", "") or "", it.get("snippet", "") or "",
+                         it.get("from_raw", "") or "", email]).lower()
+        hit = q in blob
+        if not hit:
+            for tid in et.get(email, []):
+                msgs = _thread_cache.get(tid)
+                if not msgs:
+                    continue
+                if any(q in (m.get("body_plain_text") or "").lower() for m in msgs):
+                    hit = True
+                    break
+        if hit:
+            mids.append(it["message_id"])
+    return jsonify({"ok": True, "q": q, "mids": mids})
+
 @app.route("/api/email/<message_id>")
 def api_email(message_id):
     item = next((i for i in (_cache.get("inbox") or []) if i["message_id"] == message_id), None)
@@ -1997,7 +2024,7 @@ body.resizing{user-select:none;cursor:col-resize}
 
 <div class="sidebar">
   <div class="sb-brand">📮 邮件回复助手</div>
-  <input id="search" placeholder="🔍 搜索邮箱 / 名字 / 主题" oninput="renderList()">
+  <input id="search" placeholder="🔍 搜索邮箱 / 名字 / 主题 / 对话内容" oninput="onSearchInput()">
   <div class="sb-list">
     <div class="sb-item active" onclick="setFilter(this,'all')">📥 全部<span class="cnt" id="c-all"></span></div>
     <div class="sb-item" onclick="setFilter(this,'unread')">● 未读<span class="cnt" id="c-unread"></span></div>
@@ -2078,6 +2105,7 @@ body.resizing{user-select:none;cursor:col-resize}
       <div class="sec sec-in">
         <div class="sec-title">💬 完整往来
           <span id="p-date" style="font-weight:400;color:var(--text-3)"></span>
+          <button class="t-btn" id="conv-trans-btn" onclick="toggleConvTrans()" style="margin-left:auto" title="把整段往来翻译成中文（再点切回原文）">🌐 翻译</button>
         </div>
         <div class="conv" id="p-incoming">加载中...</div>
       </div>
@@ -2293,10 +2321,15 @@ function filteredItems(){
   else if(f==='reviewing')items=items.filter(isReviewing);
   else if(f==='round2')   items=items.filter(i=>needsReply(i) && i.round2);
   const q = (document.getElementById('search')?.value||'').trim().toLowerCase();
-  if(q) items = items.filter(i =>
-    i.email.toLowerCase().includes(q) ||
-    (i.from_raw||'').toLowerCase().includes(q) ||
-    (i.subject||'').toLowerCase().includes(q));
+  if(q){
+    const useContent = (_contentQ===q);   // 后端内容命中只在 query 一致时采用，避免输入过程中串味
+    items = items.filter(i =>
+      i.email.toLowerCase().includes(q) ||
+      (i.from_raw||'').toLowerCase().includes(q) ||
+      (i.subject||'').toLowerCase().includes(q) ||
+      (i.snippet||'').toLowerCase().includes(q) ||
+      (useContent && _contentHits.has(i.message_id)));
+  }
   // 当前打开的会话永远保留在列表里——回复后状态变了也不从当前筛选里消失（微信式连续感）
   if(_selMid && !items.some(i=>i.message_id===_selMid)){
     const cur = allItems.find(i=>i.message_id===_selMid);
@@ -2378,6 +2411,57 @@ function avatarHTML(item){
   return `<span class="avatar" style="background:${AV_COLORS[h%AV_COLORS.length]}">${escHTML(ch)}</span>`;
 }
 
+// 一键翻译：打开邮件不再自动翻，点按钮把整段往来译成中文（命中缓存即时），再点切回原文
+let _convDlg = [], _convMid = '', _convTransOn = false, _convTransLoaded = false;
+function toggleConvTrans(){
+  const btn = document.getElementById('conv-trans-btn');
+  if(!_convDlg.length){ return; }
+  _convTransOn = !_convTransOn;
+  const blocks = document.querySelectorAll('#p-incoming .qtrans');
+  if(!_convTransOn){                                  // 切回原文
+    blocks.forEach(el=>el.style.display='none');
+    btn.textContent = '🌐 翻译';
+    return;
+  }
+  if(_convTransLoaded){                               // 已翻过，直接显示
+    blocks.forEach(el=>{ if(el.innerHTML) el.style.display='block'; });
+    btn.textContent = '🌐 原文';
+    return;
+  }
+  const mid = _convMid;
+  btn.textContent = '🌐 翻译中…';
+  fetch('/api/translate-texts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({texts: _convDlg.map(m=>m.text)})}).then(r=>r.json()).then(t=>{
+    if(_selMid!==mid){ return; }
+    if(!t.ok){ btn.textContent='🌐 翻译'; _convTransOn=false; return; }
+    const inc = document.getElementById('p-incoming');
+    const atBottom = inc.scrollHeight - inc.scrollTop - inc.clientHeight < 60;
+    (t.trans||[]).forEach((tr,i)=>{
+      const el = document.getElementById('qt-'+i);
+      if(el && tr){ el.innerHTML = linkify(escHTML(tr)); el.style.display='block'; }
+    });
+    if(atBottom) inc.scrollTop = inc.scrollHeight;
+    _convTransLoaded = true;
+    btn.textContent = '🌐 原文';
+  }).catch(()=>{ btn.textContent='🌐 翻译'; _convTransOn=false; });
+}
+
+// 按对话内容搜索：本地字段先即时过滤，后端再去翻完整往来正文，命中合并进来
+let _contentHits = new Set(), _contentQ = '', _searchTimer = null;
+function onSearchInput(){
+  renderList();   // 本地（邮箱/名字/主题/摘要）即时过滤
+  clearTimeout(_searchTimer);
+  const q = (document.getElementById('search').value||'').trim().toLowerCase();
+  if(q.length < 2){ _contentHits = new Set(); _contentQ = ''; return; }
+  _searchTimer = setTimeout(async ()=>{
+    try{
+      const r = await fetch('/api/search?q='+encodeURIComponent(q));
+      const d = await r.json();
+      if(d.ok && d.q===q){ _contentHits = new Set(d.mids||[]); _contentQ = q; renderList(); }
+    }catch(e){}
+  }, 250);
+}
+
 function renderList(){
   const items = filteredItems();
   const el = document.getElementById('maillist');
@@ -2435,6 +2519,8 @@ async function openItem(mid){
 
   document.getElementById('p-date').textContent='';
   document.getElementById('p-incoming').innerHTML='<span style="color:var(--text-3);font-size:12px">加载中...</span>';
+  _convDlg=[]; _convMid=''; _convTransOn=false; _convTransLoaded=false;   // 重置上一封的翻译状态
+  { const tb=document.getElementById('conv-trans-btn'); if(tb) tb.textContent='🌐 翻译'; }
 
   resetReplyBox();
   document.getElementById('p-gen').disabled=false;
@@ -2465,17 +2551,7 @@ async function openItem(mid){
           </div>`).join('');
         inc.scrollTop = inc.scrollHeight;
         document.getElementById('p-date').textContent = `共 ${dlg.length} 条往来`;
-        // 原生双语：译文已预热则瞬时返回（我方/对方都翻，方便核验 AI 发出去的英文）
-        fetch('/api/translate-texts',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({texts: dlg.map(m=>m.text)})}).then(r=>r.json()).then(t=>{
-          if(_selMid!==mid || !t.ok) return;
-          const atBottom = inc.scrollHeight - inc.scrollTop - inc.clientHeight < 60;
-          (t.trans||[]).forEach((tr,i)=>{
-            const el = document.getElementById('qt-'+i);
-            if(el && tr){ el.innerHTML = linkify(escHTML(tr)); el.style.display='block'; }
-          });
-          if(atBottom) inc.scrollTop = inc.scrollHeight;   // 没在翻历史就跟到底部
-        }).catch(()=>{});
+        _convDlg = dlg; _convMid = mid;   // 不再自动翻译；点「🌐 翻译」按钮按需翻（已预热则瞬时）
       } else if((d.chain||[]).length){
         // 兜底：没聚合到对话时退回单封引用链
         const chain = d.chain;
@@ -3116,7 +3192,7 @@ document.getElementById('p-short').checked = localStorage.getItem('bloome-short'
 loadReplies();
 pollPreload();
 refreshPending();
-setInterval(()=>loadReplies(true), 60*60*1000);   // 收件箱自动同步：每 1 小时（手动刷新随时可点）
+setInterval(()=>loadReplies(true), 10*60*1000);   // 收件箱自动同步：每 10 分钟（手动刷新随时可点）
 </script>
 </body>
 </html>"""
