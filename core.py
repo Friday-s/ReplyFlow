@@ -476,6 +476,32 @@ def send_reply_direct(message_id: str, html_body: str, with_image: bool = False,
         msg = (r.stderr or r.stdout or "unknown error").strip()
     return False, str(msg)[:200]
 
+def send_draft(draft_id: str) -> tuple:
+    """发布一个已存在的飞书草稿（走原生 POST /drafts/:id/send，等同飞书界面从草稿箱发出）。
+    返回 (ok, info)；info 失败时为错误字符串（'missing_scope' = 发送权限未批）。"""
+    if not draft_id:
+        return False, "no draft_id"
+    cmd = (f"lark-cli mail +draft-send --draft-id '{draft_id}' "
+           f"--as user --mailbox me --yes")
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+    result = None
+    for raw in (r.stdout or "", r.stderr or ""):
+        raw = raw.strip()
+        if "{" in raw:
+            try:
+                result = json.loads(raw[raw.index("{"):])
+                break
+            except Exception:
+                continue
+    if result and result.get("ok"):
+        return True, result.get("data", {})
+    blob = json.dumps(result or {}, ensure_ascii=False).lower()
+    if "missing_scope" in blob or "required scope" in blob or "does not cover" in blob:
+        return False, "missing_scope"
+    err = (result or {}).get("error") or {}
+    msg = (err.get("message") if isinstance(err, dict) else None) or (r.stderr or r.stdout or "unknown error").strip()
+    return False, str(msg)[:200]
+
 def mark_email_read(message_id: str) -> bool:
     """把飞书邮箱里的邮件标为已读（去掉 UNREAD 标签）。"""
     r = subprocess.run(

@@ -24,7 +24,7 @@ from core import (
     preview_direct_ad_text, preview_direct_ad_text_zh,
     preview_generic_text, preview_generic_text_zh,
     _plain_to_html, _create_reply_draft_opt,
-    send_reply_direct, mark_email_read,
+    send_reply_direct, send_draft, mark_email_read,
     BASE_TOKEN, TABLE_ID, FROM_ADDRESS,
 )
 from mail_store import APP_DATA_DIR, MailStore
@@ -133,19 +133,21 @@ def _save_pending():
 _pending = _load_pending()   # message_id → {email, text, kind, with_image, ts}
 
 def _send_or_draft(message_id: str, html: str, with_image: bool, image_paths=None):
-    if _send_state["mode"] != "draft":
-        ok, info = send_reply_direct(message_id, html, with_image, image_paths)
-        if ok:
-            _send_state["mode"] = "direct"
-            return "sent", {}
-        if info == "missing_scope":
-            _send_state["mode"] = "draft"
-        else:
-            return "error", info
+    """两步发送：先在飞书建回复草稿（飞书侧可见、留痕），再发布该草稿（原生 draft-send）。
+    没有发送权限就停在草稿（用户去飞书草稿箱手动发）。"""
     draft_id, draft_url = _create_reply_draft_opt(message_id, html, with_image, image_paths)
-    if draft_url:
-        return "drafted", draft_url
-    return "error", "草稿创建失败"
+    if not draft_id:
+        return "error", "飞书草稿创建失败"
+    if _send_state["mode"] == "draft":
+        return "drafted", draft_url            # 已知无发送权限，停在草稿
+    ok, info = send_draft(draft_id)
+    if ok:
+        _send_state["mode"] = "direct"
+        return "sent", {}
+    if info == "missing_scope":
+        _send_state["mode"] = "draft"
+        return "drafted", draft_url            # 降级：草稿已建好，去飞书草稿箱发
+    return "error", f"{info}（草稿已建好，可去飞书草稿箱发送）"
 
 # ── 收件箱（JSON 格式，含 thread_id / labels） ─────────────────────────────────
 def _triage_json(folder: str, max_n: int = 100) -> list:
