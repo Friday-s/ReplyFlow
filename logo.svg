@@ -1,0 +1,11 @@
+<svg width="160" height="160" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReplyFlow">
+  <!-- 复古赤陶邮票底 -->
+  <rect x="2" y="2" width="36" height="36" rx="11" fill="#c0613a"/>
+  <!-- 内描边（邮票感） -->
+  <rect x="5.5" y="5.5" width="29" height="29" rx="8" fill="none" stroke="#fbf4e2" stroke-opacity=".22" stroke-width="1"/>
+  <!-- Reply：奶油色回复箭头（chevron + 短杆） -->
+  <path d="M16.8 11.4 L9.8 18 L16.8 24.6" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M10.4 18 H19.4" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round"/>
+  <!-- Flow：箭头流入一道 teal 水波 -->
+  <path d="M18.8 18 q3.1 -5 6.2 0 q3.1 5 6.2 0" fill="none" stroke="#5fb3a1" stroke-width="2.5" stroke-linecap="round"/>
+</svg>
