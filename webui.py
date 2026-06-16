@@ -1071,6 +1071,7 @@ def api_replies():
     }
     return jsonify({"ok": True, "stats": stats, "items": inbox,
                     "send_mode": _send_state["mode"], "auto_sync": _auto_sync,
+                    "status_options": get_status_options(),   # 下拉/颜色以飞书该字段为准
                     "refreshing": _reload_lock["running"]})
 
 @app.route("/api/search")
@@ -1500,7 +1501,7 @@ def api_stats():
         total += 1
         st = _status_text(r.get("联系状态"))
         counts[st] = counts.get(st, 0) + 1
-    order = FEISHU_STATUS_OPTIONS + ["已上线", "（未填）"]
+    order = status_option_names() + ["（未填）"]
     ordered = [{"status": s, "count": counts.pop(s)} for s in order if s in counts]
     ordered += [{"status": s, "count": c} for s, c in counts.items()]   # 兜底：顺序外的状态
     return jsonify({"ok": True, "total": total, "counts": ordered})
@@ -1870,8 +1871,61 @@ def api_pending_send():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"ok": True, "total": len(targets)})
 
-FEISHU_STATUS_OPTIONS = ["待联系", "已联系", "沟通中", "达成合作", "推进制作",
-                         "待定", "需审核", "不合适", "无法合作"]
+# 联系状态选项：直接从飞书该字段动态拉（顺序+颜色都以飞书为准，永不漂移），拉失败才回退到下面这份
+_STATUS_FALLBACK = ["待联系", "已联系", "沟通中", "无法合作", "达成合作",
+                    "不合适", "需审核", "待定", "已上线", "推进制作"]
+_STATUS_FIELD_NAME = "联系状态"
+_status_field_id = {"id": "fldQfIwTpZ"}   # 默认值；按字段名查到后更新（字段重建 id 会变、名字不变）
+_HUE_CSS = {"Blue": "#3a7bd5", "Orange": "#e08a1e", "Wathet": "#3aa3cf", "Carmine": "#cf4f7a",
+            "Green": "#3aaf6e", "Red": "#cf4d3f", "Yellow": "#c79a3e", "Lime": "#7aa93e",
+            "Purple": "#9a6de0", "Turquoise": "#3aada0", "Violet": "#8a6de0", "Pink": "#d8618c",
+            "Indigo": "#6d7cff", "Gray": "#8a8f99", "Grey": "#8a8f99"}
+_status_opts = {"list": None, "ts": 0}   # 缓存 [{name,color}]
+
+def _resolve_status_field_id():
+    """按字段名「联系状态」查 field_id（比硬编码 id 稳）；查不到就用上次/默认值。"""
+    try:
+        r = _run_json(f"lark-cli base +field-list "
+                      f"--base-token {BASE_TOKEN} --table-id {TABLE_ID} --as user")
+        for f in (((r or {}).get("data") or {}).get("items") or []):
+            if (f.get("field_name") or f.get("name")) == _STATUS_FIELD_NAME:
+                fid = f.get("field_id") or f.get("id")
+                if fid:
+                    _status_field_id["id"] = fid
+                    break
+    except Exception:
+        pass
+    return _status_field_id["id"]
+
+def get_status_options(force=False):
+    """从飞书拉「联系状态」字段的真实选项（含顺序+颜色），缓存 10 分钟；失败回退 _STATUS_FALLBACK。"""
+    now = time.time()
+    if not force and _status_opts["list"] and now - _status_opts["ts"] < 600:
+        return _status_opts["list"]
+    out = []
+    try:
+        fid = _resolve_status_field_id()
+        r = _run_json(
+            f"lark-cli base +field-search-options "
+            f"--base-token {BASE_TOKEN} --table-id {TABLE_ID} "
+            f"--field-id {fid} --as user"
+        )
+        for o in (((r or {}).get("data") or {}).get("options") or []):
+            nm = (o.get("name") or "").strip()
+            if nm:
+                out.append({"name": nm, "color": _HUE_CSS.get(o.get("hue"), "#8a8f99")})
+    except Exception:
+        out = []
+    if out:
+        _status_opts.update(list=out, ts=now)
+    elif not _status_opts["list"]:
+        _status_opts["list"] = [{"name": n, "color": "#8a8f99"} for n in _STATUS_FALLBACK]
+    return _status_opts["list"]
+
+def status_option_names():
+    return [o["name"] for o in get_status_options()]
+
+FEISHU_STATUS_OPTIONS = _STATUS_FALLBACK   # 兼容旧引用（仅回退默认；实际校验/渲染走动态选项）
 
 @app.route("/api/feishu-update", methods=["POST"])
 def api_feishu_update():
@@ -1884,7 +1938,7 @@ def api_feishu_update():
     rid = item["record_id"]
     if "status" in data:
         st = str(data["status"]).strip()
-        if st not in FEISHU_STATUS_OPTIONS:
+        if st not in status_option_names():
             return jsonify({"ok": False, "error": "未知状态选项"})
         if not update_feishu_status(rid, st):
             return jsonify({"ok": False, "error": "写入飞书失败"})
@@ -2377,6 +2431,8 @@ applyTheme(new URLSearchParams(location.search).get('theme') || localStorage.get
 
 /* ── 全局状态 ── */
 let allItems = [], currentFilter = 'all';
+let STATUS_OPTIONS = [];   // 联系状态选项 [{name,color}]，来自飞书该字段（/api/replies 灌入）
+function statusColorOf(name){ const o=STATUS_OPTIONS.find(x=>x.name===name); return o&&o.color; }
 let _selMid = '';
 let _type='', _lang='en';
 let _selected = new Set();
@@ -2392,6 +2448,7 @@ async function loadReplies(force=false){
     const d = await res.json();
     window.__refreshing = !!d.refreshing;
     allItems = d.items||[];
+    if(d.status_options && d.status_options.length) STATUS_OPTIONS = d.status_options;
     updateStats(d.stats||{});
     if(d.auto_sync && d.auto_sync.last){
       const si = document.getElementById('sync-info');
@@ -2764,7 +2821,9 @@ function refreshQuick(item){
 /* ── 飞书档案卡 ── */
 function fStatusColor(s){
   if(!s) return 'var(--c-gray)';
-  if(s.includes('不合适')||s.includes('拒绝')) return 'var(--c-red)';
+  const c = statusColorOf(s);              // 优先用飞书该选项的真实颜色
+  if(c) return c;
+  if(s.includes('不合适')||s.includes('拒绝')||s.includes('无法')) return 'var(--c-red)';
   if(s.includes('沟通中')) return 'var(--c-amber)';
   if(s.includes('达成')||s.includes('上线')||s.includes('合作')) return 'var(--c-green)';
   if(s.includes('已联系')) return 'var(--c-blue)';
@@ -2782,7 +2841,11 @@ function renderFCard(item){
   if(!f){
     chips.push('<span class="f-empty">未入库 — 该发件人不在飞书表里</span>');
   } else {
-    const opts = ['待联系','已联系','沟通中','达成合作','推进制作','待定','需审核','不合适','无法合作']
+    const optNames = STATUS_OPTIONS.length ? STATUS_OPTIONS.map(o=>o.name)
+      : ['待联系','已联系','沟通中','无法合作','达成合作','不合适','需审核','待定','已上线','推进制作'];
+    // 当前状态若不在选项里（飞书有但还没拉到/被改名）也保留，避免下拉里看不到当前值
+    if(f.status && !optNames.includes(f.status)) optNames.push(f.status);
+    const opts = optNames
       .map(o=>`<option value="${o}" ${o===f.status?'selected':''}>${o}</option>`).join('');
     chips.push(`<span class="f-chip"><span class="f-dot" style="background:${fStatusColor(f.status)}"></span><span class="k">状态</span>`
       + `<select class="f-status-sel" onchange="fcardStatus('${item.message_id}', this)" title="直接改飞书表的联系状态">${opts}</select>`
@@ -3288,7 +3351,7 @@ async function openStats(){
     document.getElementById('stats-total').textContent='共 '+d.total+' 位博主';
     const max=Math.max(1,...d.counts.map(c=>c.count));
     body.innerHTML = d.counts.map(c=>{
-      const col=STATUS_COLORS[c.status]||'#6b7280';
+      const col=statusColorOf(c.status)||STATUS_COLORS[c.status]||'#6b7280';
       const pct=Math.round(c.count/max*100);
       return `<div style="display:flex;align-items:center;gap:10px;margin:7px 0">
         <span style="flex:0 0 84px;font-size:12.5px;color:var(--text)">${escHTML(c.status)}</span>
