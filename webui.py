@@ -1989,32 +1989,30 @@ def api_mark():
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
-<html lang="zh" data-theme="light">
+<html lang="zh" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ReplyFlow · 邮件回复助手</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
-/* 复古·浓咖啡夜（琥珀终端感） */
 :root[data-theme="dark"]{
-  --bg:#1e1813; --bg-2:#251e16; --card:#2c241b; --card-hover:#352b20; --card-sel:#3e3125;
-  --border:#3f3427; --border-2:#534434;
-  --text:#f0e3c8; --text-2:#bda988; --text-3:#897a60;
-  --accent:#d98f4e; --accent-hover:#e8a163; --on-accent:#1e1813;
-  --c-blue:#6fa8bf; --c-red:#e07a5f; --c-green:#a6bb6e; --c-amber:#e6b43f;
-  --c-indigo:#a890c4; --c-gray:#9c8d72;
-  --input-bg:#181410;
+  --bg:#0c0f16; --bg-2:#10141d; --card:#141925; --card-hover:#1a2130; --card-sel:#1c2336;
+  --border:#1f2735; --border-2:#2a3447;
+  --text:#e8ecf4; --text-2:#9aa4b8; --text-3:#5d6778;
+  --accent:#6d7cff; --accent-hover:#7e8bff; --on-accent:#fff;
+  --c-blue:#60a5fa; --c-red:#f87171; --c-green:#34d399; --c-amber:#fbbf24;
+  --c-indigo:#818cf8; --c-gray:#94a3b8;
+  --input-bg:#0a0e17;
 }
-/* 复古·羊皮纸（米色纸张 + 赤陶强调），默认 */
 :root[data-theme="light"]{
-  --bg:#f1e6cd; --bg-2:#e8dbbe; --card:#fbf4e2; --card-hover:#f4ead2; --card-sel:#f0e1bf;
-  --border:#dac9a2; --border-2:#c6b083;
-  --text:#3a2c1c; --text-2:#6e5a43; --text-3:#9c8865;
-  --accent:#c0613a; --accent-hover:#a84e2c; --on-accent:#fbf4e2;
-  --c-blue:#3a7c92; --c-red:#b5402f; --c-green:#5f7a3e; --c-amber:#cf8b22;
-  --c-indigo:#6d5a8c; --c-gray:#8a7a60;
-  --input-bg:#f6eed8;
+  --bg:#f4f5f9; --bg-2:#fbfbfd; --card:#ffffff; --card-hover:#f7f8fe; --card-sel:#eef0ff;
+  --border:#e6e9f2; --border-2:#d4d9e6;
+  --text:#1a2233; --text-2:#5a6680; --text-3:#9aa3b8;
+  --accent:#5b6cff; --accent-hover:#4a5bf0; --on-accent:#fff;
+  --c-blue:#2563eb; --c-red:#dc2626; --c-green:#059669; --c-amber:#d97706;
+  --c-indigo:#4f46e5; --c-gray:#64748b;
+  --input-bg:#f4f5f9;
 }
 *{box-sizing:border-box}
 html,body{margin:0;padding:0;height:100%}
@@ -2024,10 +2022,10 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 
 /* 飞书邮箱式左侧导航栏 */
 .sidebar{width:208px;flex-shrink:0;background:var(--bg-2);display:flex;flex-direction:column;padding:12px 10px 10px;gap:10px;min-height:0;overflow:hidden}
-.sb-brand{display:flex;align-items:center;gap:9px;padding:3px 4px 2px;white-space:nowrap}
-.sb-logo{width:27px;height:27px;flex-shrink:0;border-radius:8px;box-shadow:0 1px 0 rgba(0,0,0,.08)}
+.sb-brand{display:flex;align-items:center;gap:8px;padding:3px 4px 2px;white-space:nowrap}
+.sb-logo{width:40px;height:40px;flex-shrink:0}
 .sb-word{font-family:Georgia,"Songti SC","Times New Roman",serif;font-size:18px;font-weight:700;letter-spacing:.4px;color:var(--text)}
-.sb-word .fl{color:var(--accent)}
+.sb-word .fl{color:#c15a3c}
 .icon-btn{width:28px;height:28px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text-2);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:13px;transition:all .15s;flex-shrink:0}
 .icon-btn:hover{border-color:var(--accent);color:var(--accent)}
 #search{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px 11px;font-size:12px;color:var(--text);outline:none;width:100%;box-sizing:border-box;transition:border-color .15s}
@@ -2230,12 +2228,13 @@ body.resizing{user-select:none;cursor:col-resize}
 
 <div class="sidebar">
   <div class="sb-brand">
-    <svg class="sb-logo" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" aria-label="ReplyFlow">
-      <rect x="2" y="2" width="36" height="36" rx="11" fill="#c0613a"/>
-      <rect x="5.5" y="5.5" width="29" height="29" rx="8" fill="none" stroke="#fbf4e2" stroke-opacity=".22" stroke-width="1"/>
-      <path d="M16.8 11.4 L9.8 18 L16.8 24.6" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M10.4 18 H19.4" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round"/>
-      <path d="M18.8 18 q3.1 -5 6.2 0 q3.1 5 6.2 0" fill="none" stroke="#5fb3a1" stroke-width="2.5" stroke-linecap="round"/>
+    <svg class="sb-logo" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-label="ReplyFlow">
+      <rect x="7" y="13" width="42" height="38" rx="9" fill="#5f9a8b" stroke="#2f3a3e" stroke-width="3.4"/>
+      <path d="M9.5 16.5 L28 33 L46.5 16.5" fill="none" stroke="#2f3a3e" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M28 33 L16 45" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M16 45 L24 45 M16 45 L16 37" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="49" cy="48" r="11.5" fill="#c15a3c" stroke="#2f3a3e" stroke-width="3.2"/>
+      <path d="M44 48 L48 52 L55 44.5" fill="none" stroke="#f3ead4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>
     <span class="sb-word">Reply<span class="fl">Flow</span></span>
   </div>
@@ -2445,7 +2444,7 @@ function applyTheme(t){
 function toggleTheme(){
   applyTheme(document.documentElement.getAttribute('data-theme')==='dark' ? 'light' : 'dark');
 }
-applyTheme(new URLSearchParams(location.search).get('theme') || localStorage.getItem('bloome-theme') || 'light');
+applyTheme(new URLSearchParams(location.search).get('theme') || localStorage.getItem('bloome-theme') || 'dark');
 
 /* ── 全局状态 ── */
 let allItems = [], currentFilter = 'all';
@@ -3512,11 +3511,13 @@ setInterval(()=>loadReplies(true), 10*60*1000);   // 收件箱自动同步：每
 </body>
 </html>"""
 
-_FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">'
-  '<rect x="2" y="2" width="36" height="36" rx="11" fill="#c0613a"/>'
-  '<path d="M16.8 11.4 L9.8 18 L16.8 24.6" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>'
-  '<path d="M10.4 18 H19.4" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round"/>'
-  '<path d="M18.8 18 q3.1 -5 6.2 0 q3.1 5 6.2 0" fill="none" stroke="#5fb3a1" stroke-width="2.5" stroke-linecap="round"/>'
+_FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+  '<rect x="7" y="13" width="42" height="38" rx="9" fill="#5f9a8b" stroke="#2f3a3e" stroke-width="3.4"/>'
+  '<path d="M9.5 16.5 L28 33 L46.5 16.5" fill="none" stroke="#2f3a3e" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>'
+  '<path d="M28 33 L16 45" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>'
+  '<path d="M16 45 L24 45 M16 45 L16 37" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>'
+  '<circle cx="49" cy="48" r="11.5" fill="#c15a3c" stroke="#2f3a3e" stroke-width="3.2"/>'
+  '<path d="M44 48 L48 52 L55 44.5" fill="none" stroke="#f3ead4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>'
   '</svg>')
 
 @app.route("/favicon.svg")

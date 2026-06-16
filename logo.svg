@@ -1,11 +1,12 @@
-<svg width="160" height="160" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReplyFlow">
-  <!-- 复古赤陶邮票底 -->
-  <rect x="2" y="2" width="36" height="36" rx="11" fill="#c0613a"/>
-  <!-- 内描边（邮票感） -->
-  <rect x="5.5" y="5.5" width="29" height="29" rx="8" fill="none" stroke="#fbf4e2" stroke-opacity=".22" stroke-width="1"/>
-  <!-- Reply：奶油色回复箭头（chevron + 短杆） -->
-  <path d="M16.8 11.4 L9.8 18 L16.8 24.6" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M10.4 18 H19.4" fill="none" stroke="#fbf4e2" stroke-width="2.7" stroke-linecap="round"/>
-  <!-- Flow：箭头流入一道 teal 水波 -->
-  <path d="M18.8 18 q3.1 -5 6.2 0 q3.1 5 6.2 0" fill="none" stroke="#5fb3a1" stroke-width="2.5" stroke-linecap="round"/>
+<svg width="160" height="160" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReplyFlow">
+  <!-- 青绿信封 + 深描边 -->
+  <rect x="7" y="13" width="42" height="38" rx="9" fill="#5f9a8b" stroke="#2f3a3e" stroke-width="3.4"/>
+  <!-- 信封翻盖 V -->
+  <path d="M9.5 16.5 L28 33 L46.5 16.5" fill="none" stroke="#2f3a3e" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 回复钩（奶油色） -->
+  <path d="M28 33 L16 45" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16 45 L24 45 M16 45 L16 37" fill="none" stroke="#f3ead4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 赤陶对勾徽章 -->
+  <circle cx="49" cy="48" r="11.5" fill="#c15a3c" stroke="#2f3a3e" stroke-width="3.2"/>
+  <path d="M44 48 L48 52 L55 44.5" fill="none" stroke="#f3ead4" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
