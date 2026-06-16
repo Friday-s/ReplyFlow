@@ -45,7 +45,11 @@ INTERNAL_DOMAINS = tuple(
               or os.getenv("REPLYDESK_INTERNAL_DOMAINS", "")).split(",")
     if d.strip()
 )
-EXCLUDE_FROM     = ("mailer-daemon", "noreply", "no-reply")
+EXCLUDE_FROM     = ("mailer-daemon",)   # 仅退信不进列表（退信单独处理→置无法合作）
+NOTICE_FROM      = ("noreply", "no-reply", "donotreply", "do-not-reply", "do_not_reply",
+                    "no_reply")   # noreply 类 → 归「🔔 通知」分组，不进待处理/全部
+def _is_notice_from(fr: str) -> bool:
+    return any(x in (fr or "").lower() for x in NOTICE_FROM)
 
 # ── 持久化状态（按 message_id；含旧格式自动迁移） ───────────────────────────────
 STATE_FILE = APP_DATA_DIR / "outreach-state.json"
@@ -325,6 +329,7 @@ def _build_inbox():
             "subject":    msg["subject"],
             "date":       msg["date"][:16],
             "unread":     "UNREAD" in msg.get("labels", ""),
+            "is_notice":  _is_notice_from(fr),
             "matched":    matched,
             "platform":   platform,
             "url":        rec.get("_url", "") if matched else "",
@@ -2181,6 +2186,7 @@ body.resizing{user-select:none;cursor:col-resize}
     <div class="sb-item" onclick="setFilter(this,'github')">GitHub<span class="cnt" id="c-github"></span></div>
     <div class="sb-item" onclick="setFilter(this,'youtube')">YouTube<span class="cnt" id="c-youtube"></span></div>
     <div class="sb-item" onclick="setFilter(this,'other')">其他<span class="cnt" id="c-other"></span></div>
+    <div class="sb-item" onclick="setFilter(this,'notice')" title="noreply / no-reply 类自动邮件（平台通知、付款/发票确认等）——单独归这里，不进待处理/全部">🔔 通知<span class="cnt" id="c-notice"></span></div>
   </div>
   <div class="sb-foot">
     <button class="btn btn-send btn-sm" id="pending-btn" onclick="openReview()" style="display:none;width:100%;justify-content:center">📬 待发送审核 (0)</button>
@@ -2423,12 +2429,14 @@ async function loadReplies(force=false){
 }
 function updateStats(s){
   const set=(id,v)=>{const el=document.getElementById(id); if(el) el.textContent = v??0;};
-  set('c-all',s.total); set('c-unread',s.unread);
-  set('c-pending', allItems.filter(needsReply).length);   // 排除需审核/寒暄收尾后的真待处理
+  const nn = allItems.filter(i=>!i.is_notice);   // 全部/未读/平台等计数都不含通知，与列表一致
+  set('c-all', nn.length); set('c-unread', nn.filter(i=>i.unread&&!i.action).length);
+  set('c-notice', allItems.filter(i=>i.is_notice).length);
+  set('c-pending', allItems.filter(needsReply).length);   // 排除需审核/寒暄收尾/通知后的真待处理
   set('c-sent',s.sent); set('c-drafted',s.drafted); set('c-replied',s.replied); set('c-ns',s.not_suitable);
-  set('c-github', allItems.filter(i=>i.platform==='github').length);
-  set('c-youtube',allItems.filter(i=>i.platform==='youtube').length);
-  set('c-other',  allItems.filter(i=>i.platform!=='github'&&i.platform!=='youtube').length);
+  set('c-github', nn.filter(i=>i.platform==='github').length);
+  set('c-youtube',nn.filter(i=>i.platform==='youtube').length);
+  set('c-other',  nn.filter(i=>i.platform!=='github'&&i.platform!=='youtube').length);
   set('c-coop',   allItems.filter(i=>/达成合作|推进制作/.test(i.feishu_status||'')).length);
   set('c-farewell',allItems.filter(i=>/不合适|无法合作/.test(i.feishu_status||'') && i.action!=='not_suitable' && !i.farewell_done).length);
   set('c-followup',allItems.filter(i=>i.followup).length);
@@ -2454,6 +2462,7 @@ function setFilter(btn,f){
 }
 // 真正需要我回的：没处理过 + 不在等领导审核 + 不是"我回过后对方只是寒暄收尾"
 function needsReply(i){
+  if(i.is_notice) return false;                               // noreply 类通知不用回
   if(i.action) return false;
   if(/需审核/.test(i.feishu_status||'')) return false;        // 等领导审核，不用回（→审核中）
   if((i.intent||{}).label==='寒暄' && i.round2) return false; // 我回过、对方只是 thanks 收尾
@@ -2461,9 +2470,11 @@ function needsReply(i){
 }
 function isReviewing(i){ return !i.action && /需审核/.test(i.feishu_status||''); }
 function filteredItems(){
-  let items = allItems;
   const f = currentFilter;
-  if(f==='unread')        items=items.filter(i=>i.unread&&!i.action);
+  // noreply 类通知只在「🔔 通知」分组出现，其余所有视图（含全部）都排除，避免淹没主区
+  let items = (f==='notice') ? allItems.filter(i=>i.is_notice) : allItems.filter(i=>!i.is_notice);
+  if(f==='notice')        items=[...items];
+  else if(f==='unread')   items=items.filter(i=>i.unread&&!i.action);
   else if(f==='pending')  items=items.filter(needsReply);
   else if(f==='github')   items=items.filter(i=>i.platform==='github');
   else if(f==='youtube')  items=items.filter(i=>i.platform==='youtube');
