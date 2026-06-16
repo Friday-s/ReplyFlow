@@ -30,10 +30,10 @@ from core import (
 from mail_store import APP_DATA_DIR, MailStore
 
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, send_file
 except ImportError:
     os.system(f"{sys.executable} -m pip install flask -q")
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,9 +127,9 @@ def _save_pending():
 
 _pending = _load_pending()   # message_id → {email, text, kind, with_image, ts}
 
-def _send_or_draft(message_id: str, html: str, with_image: bool):
+def _send_or_draft(message_id: str, html: str, with_image: bool, image_paths=None):
     if _send_state["mode"] != "draft":
-        ok, info = send_reply_direct(message_id, html, with_image)
+        ok, info = send_reply_direct(message_id, html, with_image, image_paths)
         if ok:
             _send_state["mode"] = "direct"
             return "sent", {}
@@ -137,7 +137,7 @@ def _send_or_draft(message_id: str, html: str, with_image: bool):
             _send_state["mode"] = "draft"
         else:
             return "error", info
-    draft_id, draft_url = _create_reply_draft_opt(message_id, html, with_image)
+    draft_id, draft_url = _create_reply_draft_opt(message_id, html, with_image, image_paths)
     if draft_url:
         return "drafted", draft_url
     return "error", "草稿创建失败"
@@ -1409,12 +1409,52 @@ def api_preview():
         text = preview_generic_text_zh(name) if zh else preview_generic_text(name)
     return jsonify({"ok": True, "text": text})
 
+REPLY_IMG_DIR = Path.home() / ".bloome-reply-images"   # 用户随回复上传的图片（数据目录外，不入库）
+_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+@app.route("/api/upload-image", methods=["POST"])
+def api_upload_image():
+    """回复里要发的图片：上传 → 存到 ~/.bloome-reply-images → 返回 id（发送时按 id 取回内联）。"""
+    import uuid
+    f = request.files.get("image")
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "没有文件"})
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in _IMG_EXTS:
+        return jsonify({"ok": False, "error": "仅支持 png/jpg/gif/webp"})
+    f.seek(0, os.SEEK_END)
+    if f.tell() > 12 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "图片超过 12MB"})
+    f.seek(0)
+    REPLY_IMG_DIR.mkdir(exist_ok=True)
+    img_id = uuid.uuid4().hex + ext
+    f.save(str(REPLY_IMG_DIR / img_id))
+    return jsonify({"ok": True, "id": img_id, "name": f.filename})
+
+@app.route("/api/reply-image/<img_id>")
+def api_reply_image(img_id):
+    """回显上传图片的缩略图（前端芯片预览用）。"""
+    p = REPLY_IMG_DIR / os.path.basename(img_id)
+    if not p.exists():
+        return "not found", 404
+    return send_file(str(p))
+
+def _resolve_reply_images(image_ids):
+    """前端传的 id 列表 → 实际绝对路径列表（只保留存在的、防目录穿越）。"""
+    out = []
+    for i in (image_ids or []):
+        p = REPLY_IMG_DIR / os.path.basename(str(i))
+        if p.exists():
+            out.append(str(p))
+    return out
+
 @app.route("/api/approve", methods=["POST"])
 def api_approve():
     data       = request.json or {}
     message_id = data.get("message_id", "")
     final_body = data.get("final_body", "").strip()
     with_image = bool(data.get("with_image", False))
+    image_paths = _resolve_reply_images(data.get("images"))
     if not final_body:
         return jsonify({"ok": False, "error": "正文为空"})
     inbox = _cache.get("inbox") or []
@@ -1429,7 +1469,7 @@ def api_approve():
     def _do():
         try:
             html = _plain_to_html(final_body, with_image)
-            rtype, payload = _send_or_draft(snap["message_id"], html, with_image)
+            rtype, payload = _send_or_draft(snap["message_id"], html, with_image, image_paths)
             if rtype == "sent":
                 mark_state(snap["message_id"], snap["email"], "sent")
                 mark_email_read(snap["message_id"])
@@ -1916,6 +1956,13 @@ body.resizing{user-select:none;cursor:col-resize}
 .p-sender{font-size:15px;font-weight:700}
 .p-addr{color:var(--accent);font-size:12.5px;margin-top:2px;user-select:all}
 .p-quick{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+/* 回复待发送的图片芯片 */
+.reply-imgs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 0}
+.reply-imgs:empty{display:none}
+.rimg-chip{position:relative;width:64px;height:64px;border-radius:8px;border:1px solid var(--border);overflow:hidden;background:var(--bg-2);flex-shrink:0}
+.rimg-chip img{width:100%;height:100%;object-fit:cover;display:block}
+.rimg-chip .rm{position:absolute;top:2px;right:2px;width:18px;height:18px;border:none;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;font-size:12px;line-height:18px;text-align:center;cursor:pointer;padding:0}
+.rimg-chip.up{display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--text-3)}
 /* 飞书档案卡：该博主在多维表格里的状态/标签/备注，一处看全 */
 .f-card{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 12px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;font-size:11.5px;color:var(--text-2);flex-shrink:0}
 .f-chip{display:inline-flex;align-items:center;gap:5px;padding:2.5px 9px;border-radius:99px;background:var(--bg-2);border:1px solid var(--border);white-space:nowrap}
@@ -2129,11 +2176,15 @@ body.resizing{user-select:none;cursor:col-resize}
           <span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">
             <button class="t-btn" onclick="openPayment()" title="AI 从对话预填付款申请，照着去飞书「运营推广付款申请」提交">💰 付款申请</button>
             <button class="t-btn" id="p-copy" onclick="copyReply()" title="复制正文，去飞书手动粘贴发送">📋</button>
-            <label class="checklab" title="发送时在邮件末尾附 Bloome 介绍图"><input type="checkbox" id="p-img">图</label>
+            <button class="t-btn" onclick="document.getElementById('p-img-file').click()" title="上传图片随这封回复一起发出（也可直接在正文框里粘贴图片）">🖼️ 图片</button>
+            <input type="file" id="p-img-file" accept="image/*" multiple style="display:none" onchange="attachImages(this.files); this.value=''">
+            <label class="checklab" title="发送时在邮件末尾附 Bloome 介绍图"><input type="checkbox" id="p-img">官方图</label>
           </span>
         </div>
+        <div id="p-imgs" class="reply-imgs"></div>
         <div class="chat-input">
           <textarea class="p-edit" id="p-edit" oninput="fitReply()" rows="2"
+            onpaste="onReplyPaste(event)"
             onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();approveSend();}"
             placeholder="像微信一样：输入中文指示（如：答应150/月）点「生成」，AI 写好英文稿就地替换；也可直接手写正文。⌘+回车 = 发送"></textarea>
           <div class="chat-btns">
@@ -2711,7 +2762,46 @@ function resetReplyBox(){
   _lastDraft = '';
   const tr = document.getElementById('p-edit-trans');
   tr.style.display='none'; tr.textContent='';
+  clearReplyImgs();
   hideRate();
+}
+
+/* ── 回复里发图片：上传 → 芯片预览 → 发送时按 id 内联 ── */
+let _replyImgs = [];   // [{id, name}]
+function clearReplyImgs(){ _replyImgs = []; renderReplyImgs(); }
+function renderReplyImgs(){
+  const box = document.getElementById('p-imgs');
+  if(!box) return;
+  box.innerHTML = _replyImgs.map(im=>
+    `<div class="rimg-chip" title="${escHTML(im.name||'')}">
+       <img src="/api/reply-image/${encodeURIComponent(im.id)}" alt="">
+       <button class="rm" onclick="removeReplyImg('${im.id}')" title="移除">✕</button>
+     </div>`).join('');
+}
+function removeReplyImg(id){ _replyImgs = _replyImgs.filter(x=>x.id!==id); renderReplyImgs(); }
+function onReplyPaste(e){
+  const items = (e.clipboardData||{}).items||[];
+  const imgs = [];
+  for(const it of items){ if(it.type && it.type.startsWith('image/')){ const f=it.getAsFile(); if(f) imgs.push(f); } }
+  if(imgs.length){ e.preventDefault(); attachImages(imgs); }   // 粘贴图片 = 直接上传，不进正文文本
+}
+async function attachImages(files){
+  if(!files || !files.length) return;
+  const box = document.getElementById('p-imgs');
+  for(const f of files){
+    if(!f.type || !f.type.startsWith('image/')) continue;
+    const ph = document.createElement('div');
+    ph.className='rimg-chip up'; ph.textContent='上传中…'; if(box) box.appendChild(ph);
+    try{
+      const fd = new FormData(); fd.append('image', f, f.name||'paste.png');
+      const r = await fetch('/api/upload-image',{method:'POST',body:fd});
+      const d = await r.json();
+      if(d.ok){ _replyImgs.push({id:d.id, name:d.name||f.name||'image'}); }
+      else { alert('图片上传失败：'+(d.error||'')); }
+    }catch(e){ alert('图片上传失败'); }
+    finally{ ph.remove(); }
+  }
+  renderReplyImgs();
 }
 /* ── AI 回复打分 ── */
 let _rateCtx = null, _rateScore = 0;
@@ -2810,7 +2900,7 @@ async function approveSend(){
   if(!body){ status.textContent='正文为空'; return; }
   btn.disabled=true; btn.textContent='提交中...';
   const res = await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message_id:_selMid, final_body:body, with_image:withImg})});
+    body:JSON.stringify({message_id:_selMid, final_body:body, with_image:withImg, images:_replyImgs.map(x=>x.id)})});
   const d = await res.json();
   if(!d.ok){ status.textContent='❌ '+d.error; btn.disabled=false; btn.textContent='🚀 发送'; return; }
   btn.textContent='后台处理中...';

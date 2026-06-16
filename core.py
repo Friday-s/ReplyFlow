@@ -401,14 +401,51 @@ def preview_generic_text_zh(name: str = "你好") -> str:
         f"期待你的回复！\n\nIvor · Bloome\nwww.bloome.im"
     )
 
-def send_reply_direct(message_id: str, html_body: str, with_image: bool = False) -> tuple:
-    """直接发送回复（需要 message:send 权限）。返回 (ok, info)。
-    info: 成功时为发送结果 dict；失败时为错误字符串（'missing_scope' 表示权限未批）。"""
-    inline = ""
-    tmp_img_vault = VAULT_ROOT / "bloome-outreach-tmp.png"
+def _inject_before_div_close(html: str, extra: str) -> str:
+    """把 extra HTML 插到最外层 </div> 之前；没有 div 就追加到末尾。"""
+    if not extra:
+        return html
+    idx = html.rstrip().rfind("</div>")
+    if idx == -1:
+        return html + "\n" + extra
+    return html[:idx] + extra + "\n" + html[idx:]
+
+def _build_image_payload(with_image: bool, image_paths):
+    """官方图(可选) + 上传图 → (inline_specs, extra_tags, tmp_paths)。
+    官方图的 <img> 标签由正文（_plain_to_html/_build_html）已含，不放进 extra_tags（避免重复）；
+    上传图的标签要在这里补进正文。所有图都复制进 VAULT_ROOT 临时名（lark-cli --inline 要 cwd 相对路径）。"""
+    specs, extra_tags, tmps = [], [], []
     if with_image and BLOOME_IMG.exists():
-        shutil.copy(BLOOME_IMG, tmp_img_vault)
-        inline = '--inline \'[{"cid":"bloomeimg","file_path":"bloome-outreach-tmp.png"}]\''
+        shutil.copy(BLOOME_IMG, VAULT_ROOT / "bloome-outreach-tmp.png")
+        tmps.append(VAULT_ROOT / "bloome-outreach-tmp.png")
+        specs.append({"cid": "bloomeimg", "file_path": "bloome-outreach-tmp.png"})
+    for i, src in enumerate(image_paths or []):
+        p = Path(src)
+        if not p.exists():
+            continue
+        cid = "rimg%d" % i
+        tmp_name = "bloome-reply-tmp-%d%s" % (i, (p.suffix or ".png"))
+        shutil.copy(p, VAULT_ROOT / tmp_name)
+        tmps.append(VAULT_ROOT / tmp_name)
+        specs.append({"cid": cid, "file_path": tmp_name})
+        extra_tags.append(
+            '<p style="margin-top:14px;"><img src="cid:%s" alt="image" '
+            'style="max-width:560px;width:100%%;border-radius:8px;"></p>' % cid
+        )
+    return specs, extra_tags, tmps
+
+def _inline_arg(specs) -> str:
+    return ("--inline '" + json.dumps(specs) + "'") if specs else ""
+
+def send_reply_direct(message_id: str, html_body: str, with_image: bool = False,
+                      image_paths=None) -> tuple:
+    """直接发送回复（需要 message:send 权限）。返回 (ok, info)。
+    with_image=附官方 Bloome 介绍图；image_paths=用户上传的任意图片绝对路径列表，全部内联进正文。
+    info: 成功时为发送结果 dict；失败时为错误字符串（'missing_scope' 表示权限未批）。"""
+    specs, extra_tags, tmps = _build_image_payload(with_image, image_paths)
+    if extra_tags:
+        html_body = _inject_before_div_close(html_body, "\n".join(extra_tags))
+    inline = _inline_arg(specs)
     body_escaped = html_body.replace("'", "'\\''")
     cmd = (
         f"cd '{VAULT_ROOT}' && lark-cli mail +reply "
@@ -416,8 +453,9 @@ def send_reply_direct(message_id: str, html_body: str, with_image: bool = False)
         f"--body '{body_escaped}' {inline} --confirm-send"
     )
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
-    if with_image and tmp_img_vault.exists():
-        tmp_img_vault.unlink()
+    for t in tmps:
+        if t.exists():
+            t.unlink()
     # 错误时 lark-cli 输出可能在 stderr（+reply --confirm-send 实测如此），两边都解析
     result = None
     for raw in (r.stdout or "", r.stderr or ""):
@@ -459,11 +497,13 @@ def _build_html(body_html: str, with_image: bool) -> str:
         f'{body_html}\n{img}</div>'
     )
 
-def _create_reply_draft_opt(message_id: str, html_body: str, with_image: bool = True) -> tuple:
-    """统一草稿创建入口：with_image=False 时跳过图片上传。"""
-    if with_image:
-        return _create_reply_draft(message_id, html_body)
-    # 不带图：直接用 lark-cli，无 --inline
+def _create_reply_draft_opt(message_id: str, html_body: str, with_image: bool = True,
+                            image_paths=None) -> tuple:
+    """统一草稿创建入口：支持官方图 + 上传图内联（与 send_reply_direct 同一套图片逻辑）。"""
+    specs, extra_tags, tmps = _build_image_payload(with_image, image_paths)
+    if extra_tags:
+        html_body = _inject_before_div_close(html_body, "\n".join(extra_tags))
+    inline = _inline_arg(specs)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
         f.write(html_body)
         tmp_html = f.name
@@ -471,10 +511,13 @@ def _create_reply_draft_opt(message_id: str, html_body: str, with_image: bool = 
     cmd = (
         f"cd '{VAULT_ROOT}' && lark-cli mail +reply "
         f"--message-id '{message_id}' --as user --from '{FROM_ADDRESS}' --mailbox me "
-        f"--body '{body_escaped}'"
+        f"--body '{body_escaped}' {inline}"
     )
     result = _run_json(cmd)
     os.unlink(tmp_html)
+    for t in tmps:
+        if t.exists():
+            t.unlink()
     if result and result.get("ok"):
         data = result.get("data", {})
         return data.get("draft_id"), data.get("reference")
