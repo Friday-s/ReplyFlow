@@ -544,7 +544,8 @@ def _strip_quotes(body: str) -> str:
         if idx > 0:
             cut_points.append(idx)
     for pat in [r"\bOn .{5,80}?wrote:",
-                r"From:\s*\"[^\"]{1,60}\"\s*<",
+                r"(?im)^\s*From:\s*.{0,80}<[^>\s]+@[^>\s]+>",   # 引用头 From: 名字 <邮箱>（名字带不带引号都吃）
+                r"(?im)^\s*(发件人|寄件者)\s*[:：]\s*.{0,80}<[^>\s]+@[^>\s]+>",
                 r"-{2,}\s*原始邮件\s*-{2,}",          # QQ 邮箱：---原始邮件---
                 r"\bOn \w{3}, .{5,60}?<[^>]+@[^>]+>"]:
         m = re.search(pat, body)
