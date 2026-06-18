@@ -25,7 +25,7 @@ from core import (
     preview_generic_text, preview_generic_text_zh,
     _plain_to_html, _create_reply_draft_opt,
     send_reply_direct, send_draft, mark_email_read,
-    BASE_TOKEN, TABLE_ID, FROM_ADDRESS,
+    BASE_TOKEN, TABLE_ID, FROM_ADDRESS, OWNER,
 )
 from mail_store import APP_DATA_DIR, MailStore
 
@@ -327,9 +327,10 @@ def _build_inbox():
     [t.join()  for t in ths]
     records, messages, sent_threads = res.get("records") or [], res.get("messages") or [], res.get("sent") or {}
     email_map = {r["_email"]: r for r in records if r.get("_email")}
-    # 缓存「我（严胜南）名下、有邮箱」的全部记录 → 供联系状态分组按飞书全表列博主
+    # 缓存「我（OWNER）名下、有邮箱」的全部记录 → 供联系状态分组按飞书全表列博主
+    # OWNER 未配置时不过滤（单人/未配置场景显示全部）
     _cache["my_records"] = [r for r in records
-                            if r.get("_email") and "严胜南" in (r.get("负责人") or "")]
+                            if r.get("_email") and (not OWNER or OWNER in (r.get("负责人") or ""))]
     cutoff   = datetime.now(timezone.utc) - timedelta(days=7)
     state    = load_state()
     state_dirty = False
@@ -1225,7 +1226,7 @@ def api_replies():
         "replied":      sum(1 for i in inbox if i["action"] == "replied"),
         "not_suitable": sum(1 for i in inbox if i["action"] == "not_suitable"),
     }
-    return jsonify({"ok": True, "stats": stats, "items": inbox,
+    return jsonify({"ok": True, "stats": stats, "items": inbox, "owner": OWNER,
                     "send_mode": _send_state["mode"], "auto_sync": _auto_sync,
                     "status_options": get_status_options(),   # 下拉/颜色以飞书该字段为准
                     "my_status_counts": _my_status_counts(),  # 联系状态分组计数（我名下全表，非收件箱）
@@ -1703,7 +1704,7 @@ def _golive_live_set(force=False):
             ui = fields.index("主页URL") if "主页URL" in fields else -1
             oi = fields.index("负责人") if "负责人" in fields else -1
             for row in rows:
-                if oi >= 0 and "严胜南" not in json.dumps(row[oi], ensure_ascii=False):
+                if oi >= 0 and OWNER and OWNER not in json.dumps(row[oi], ensure_ascii=False):
                     continue
                 if ei >= 0 and row[ei]:
                     em = extract_email(str(row[ei]))
@@ -1841,7 +1842,8 @@ def api_add_to_base():
         _cache.setdefault("my_records", []).append(
             {"_email": email, "_url": homepage, "联系方式": email, "主页URL": homepage,
              "备注（报价、合作形式等）": note,
-             "联系状态": '["沟通中"]', "负责人": '[{"name":"严胜南"}]', "_record_id": rid})
+             "联系状态": '["沟通中"]', "负责人": json.dumps([{"name": OWNER}], ensure_ascii=False),
+             "_record_id": rid})
     except Exception:
         pass
     return jsonify({"ok": True, "record_id": rid, "homepage": homepage, "base_url": FEISHU_BASE_URL})
@@ -1933,8 +1935,8 @@ def api_stats():
     for r in records:
         if not r.get("_email"):
             continue   # 只统计有联系方式（邮箱）的博主行
-        if "严胜南" not in (r.get("负责人") or ""):
-            continue   # 共享团队表里只数 Ivor（严胜南）负责的行，不算同事的
+        if OWNER and OWNER not in (r.get("负责人") or ""):
+            continue   # 共享团队表里只数 OWNER 负责的行，不算同事的（OWNER 空=不过滤）
         total += 1
         st = _status_text(r.get("联系状态"))
         counts[st] = counts.get(st, 0) + 1
@@ -3053,6 +3055,7 @@ applyTheme(new URLSearchParams(location.search).get('theme') || localStorage.get
 
 /* ── 全局状态 ── */
 let allItems = [], currentFilter = 'all';
+let _OWNER = '';           // 我的飞书名（负责人），来自 /api/replies（多人版按此过滤/归属）
 let STATUS_OPTIONS = [];   // 联系状态选项 [{name,color}]，来自飞书该字段（/api/replies 灌入）
 function statusColorOf(name){ const o=STATUS_OPTIONS.find(x=>x.name===name); return o&&o.color; }
 let _selMid = '';
@@ -3070,6 +3073,7 @@ async function loadReplies(force=false){
     const d = await res.json();
     window.__refreshing = !!d.refreshing;
     allItems = d.items||[];
+    if(d.owner!==undefined) _OWNER = d.owner||'';
     if(d.status_options && d.status_options.length) STATUS_OPTIONS = d.status_options;
     _myStatusCounts = d.my_status_counts || _myStatusCounts;
     updateStats(d.stats||{});
@@ -3683,7 +3687,7 @@ async function addToBase(mid){
     it.matched=true; it.record_id=d.record_id||it.record_id; it.url=d.homepage||it.url||(homepage||'').trim();
     if(ccNoteTxt) it.note=ccNoteTxt;
     it.feishu_status='["沟通中"]';
-    it.feishu={status:'沟通中',tags:'',coop:'',lang:'',country:'',channel:'',owner:'严胜南',src:'',updated:'',base_url:d.base_url||''};
+    it.feishu={status:'沟通中',tags:'',coop:'',lang:'',country:'',channel:'',owner:_OWNER,src:'',updated:'',base_url:d.base_url||''};
     if(_selMid===mid) renderFCard(it);
     renderList();
     alert('✅ 已入库（状态=沟通中），现在可在档案卡改状态/记备注了'+(d.record_id?'':'（如改状态没反应，刷新一下）'));

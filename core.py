@@ -40,6 +40,7 @@ def _save_repo_disk_cache(cache: dict):
 BASE_TOKEN   = _cfg("BASE_TOKEN")
 TABLE_ID     = _cfg("TABLE_ID")
 FROM_ADDRESS = _cfg("FROM_ADDRESS")
+OWNER        = _cfg("OWNER")   # 共享团队表里"我负责的行"的人名；为空=不按负责人过滤（单人/独立表）
 VAULT_ROOT   = Path(_cfg("VAULT_ROOT", str(Path.cwd())))
 BLOOME_IMG   = Path(_cfg("BLOOME_IMG", str(Path.home() / "Downloads/bloome.png")))
 INBOX_LIMIT  = int(_cfg("INBOX_LIMIT", "200"))

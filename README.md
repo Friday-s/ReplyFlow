@@ -2,6 +2,11 @@
 
 Independent local WebUI for Feishu mail reply triage, AI drafting, review queues, and CRM updates.
 
+Each user runs their own local instance against their own Feishu account and their own
+local AI (Claude or Codex). Mail data stays on the local machine.
+
+> 团队同事自助部署，看 **[SETUP.zh.md](SETUP.zh.md)**（中文分步指南：建飞书自建应用 → 授权 → 接本地 Claude/Codex → 配置 → 跑）。
+
 ## Run
 
 ```bash
@@ -22,7 +27,9 @@ Set these locally before starting the app. Do not commit real values.
 export REPLYFLOW_BASE_TOKEN="your-feishu-base-token"
 export REPLYFLOW_TABLE_ID="your-feishu-table-id"
 export REPLYFLOW_FROM_ADDRESS="you@example.com"
+export REPLYFLOW_OWNER="Your Name"          # your name in the Feishu 负责人 field; only your rows show/count (empty = no filter)
 export REPLYFLOW_INTERNAL_DOMAINS="@your-company.com,@your-product.com"
+export REPLYFLOW_GOLIVE_TABLE_ID=""          # optional: 上线记录 table id (已上线 group / 上线 flow)
 export REPLYFLOW_BLOOME_IMG="$HOME/Downloads/promo-image.png"
 export REPLYFLOW_INBOX_LIMIT="200"
 ```
