@@ -3912,20 +3912,26 @@ function _flushPendingSend(){
   const p=_pendingSend; _pendingSend=null; _commitSend(p.payload);
 }
 async function _commitSend(payload){
+  const mid    = payload.message_id;
   const btn    = document.getElementById('p-approve');
   const status = document.getElementById('p-status');
-  if(btn){ btn.disabled=true; btn.textContent='提交中...'; }
-  const res = await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(payload)});
-  const d = await res.json();
-  if(!d.ok){ status.textContent='❌ '+d.error; btn.disabled=false; btn.textContent='🚀 发送'; return; }
-  btn.textContent='后台处理中...';
-  status.textContent='⏳ 处理中，可直接点下一封继续';
-  const mid=payload.message_id, jobId=d.job_id;
+  // 只有还停在「这封正在发的邮件」时才动共享的按钮/状态栏；已切走则后台静默发送，
+  // 否则发送态会糊到你刚切过去的别人面板上、且不会被重置（"后台处理中…"卡死的根因）。
+  const here = () => _selMid === mid;
+  const ui = (fn) => { if(here()) fn(); };
+  ui(()=>{ btn.disabled=true; btn.textContent='提交中...'; });
+  let d;
+  try{
+    const res = await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    d = await res.json();
+  }catch(e){ ui(()=>{ status.textContent='❌ 网络错误'; btn.disabled=false; btn.textContent='🚀 发送'; }); return; }
+  if(!d.ok){ ui(()=>{ status.textContent='❌ '+d.error; btn.disabled=false; btn.textContent='🚀 发送'; }); return; }
+  ui(()=>{ btn.textContent='后台处理中...'; status.textContent='⏳ 处理中，可直接点下一封继续'; });
+  const jobId=d.job_id;
   (async function poll(){
     try{
       const r2 = await fetch('/api/job/'+jobId); const job = await r2.json();
-      const here = _selMid===mid;
       if(job.status==='sent'){
         applyResult(mid,'sent',''); clearDraft(mid);
         const wasReview = (_reviewMid===mid) || _pendingItems.some(x=>x.message_id===mid);
@@ -3933,19 +3939,19 @@ async function _commitSend(payload){
           // 审核中发出的草稿 → 从队列移除并自动跳下一条
           fetch('/api/pending-discard',{method:'POST',headers:{'Content-Type':'application/json'},
             body:JSON.stringify({message_ids:[mid]})}).then(()=>refreshPending()).then(()=>{
-            if(here){ status.textContent='🚀 已发送，下一条'; btn.disabled=false; btn.textContent='🚀 发送'; }
+            ui(()=>{ status.textContent='🚀 已发送，下一条'; btn.disabled=false; btn.textContent='🚀 发送'; });
             if(_pendingItems.length){ loadPendingDraft(_pendingItems[0].message_id); }
-            else { _reviewMid=''; closeReview(); resetReplyBox(); }
+            else if(here()){ _reviewMid=''; closeReview(); resetReplyBox(); }
           });
-        } else if(here){ status.textContent='🚀 已发送！'; btn.disabled=false; btn.textContent='🚀 发送'; resetReplyBox(); openItem(mid); }
+        } else ui(()=>{ status.textContent='🚀 已发送！'; btn.disabled=false; btn.textContent='🚀 发送'; resetReplyBox(); openItem(mid); });
       } else if(job.status==='drafted'){
         applyResult(mid,'drafted',job.draft_url||'');
-        if(here){
+        ui(()=>{
           status.innerHTML='⚠️ '+(job.note||'已转草稿')+(job.draft_url?` &nbsp;<a href="${job.draft_url}" target="_blank" style="color:var(--accent)">打开草稿</a>`:'');
           btn.disabled=false; btn.textContent='🚀 发送';
-        }
+        });
       } else if(job.status==='error'){
-        if(here){ status.textContent='❌ '+job.error; btn.disabled=false; btn.textContent='🚀 发送'; }
+        ui(()=>{ status.textContent='❌ '+job.error; btn.disabled=false; btn.textContent='🚀 发送'; });
       } else setTimeout(poll, 800);
     }catch(e){ setTimeout(poll, 1500); }
   })();
