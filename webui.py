@@ -1229,14 +1229,15 @@ def api_replies():
                 c = _translate_cache.get(_intent_key(pm[-1]["text"]))
                 if isinstance(c, dict):
                     item["intent"] = c
+            # 矫正：按「这个博主自己的往来」判断——对方说了最后一句话 = 球在我这 = 待处理。
+            # 关键：msgs 已按本博主过滤，群发共享线程里「我发给别人」的发件不会算进来，
+            # 所以不会再把"没回的人"误判成已回复（旧逻辑用线程级时间戳比较，会被同线程他人发件污染）。
+            if item.get("action") in ("sent", "drafted", "replied") and msgs \
+                    and msgs[-1]["role"] == "对方":
+                item["action"] = ""
             # 二轮待回：我参与过对话、对方又回来了（批量处理谈判轮的精准筛选）
             if not item.get("action") and msgs:
                 item["round2"] = any(p["role"] == "我" for p in msgs)
-            # 矫正：对方在我方处理之后又来信 → 打回「待处理」（防状态残留漏看回复）
-            if item.get("action") in ("sent", "drafted", "replied") and msgs \
-                    and msgs[-1]["role"] == "对方" \
-                    and msgs[-1]["date"] > (item.get("action_ts") or ""):
-                item["action"] = ""
             # 待跟进：我方最后发言、对方满 24 小时没动静（每次请求重算——时间在流逝）
             if item.get("action") in ("sent", "replied") and msgs:
                 item["followup"] = False
