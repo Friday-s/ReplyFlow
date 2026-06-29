@@ -2891,11 +2891,8 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
   </div>
   <div class="sb-list">
     <div class="sb-item active" onclick="setFilter(this,'all')">📥 全部<span class="cnt" id="c-all"></span></div>
-    <div class="sb-item" onclick="setFilter(this,'unread')">● 未读<span class="cnt" id="c-unread"></span></div>
     <div class="sb-item" onclick="setFilter(this,'pending')">⏳ 待处理<span class="cnt" id="c-pending"></span></div>
-    <div class="sb-item" onclick="setFilter(this,'replied')">✅ 已回复<span class="cnt" id="c-replied"></span></div>
     <div class="sb-item" onclick="setFilter(this,'sent')">🚀 已发送<span class="cnt" id="c-sent"></span></div>
-    <div class="sb-item" onclick="setFilter(this,'drafted')">📝 草稿<span class="cnt" id="c-drafted"></span></div>
     <div class="sb-item" onclick="setFilter(this,'not_suitable')">❌ 不合适<span class="cnt" id="c-ns"></span></div>
     <div class="sb-sec">智能分组</div>
     <div class="sb-item" onclick="setFilter(this,'reviewing')" title="飞书状态=需审核：已提交内部/领导审核，正在等结果，此时不用回对方。领导审完把状态改掉后，对方未回的会自动回到「待处理」">⏳ 审核中<span class="cnt" id="c-reviewing"></span></div>
@@ -2999,11 +2996,11 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
             <input type="checkbox" id="p-faithful" onchange="localStorage.setItem('bloome-faithful',this.checked?'1':'0')">💬 只翻我说的
           </label>
           <span class="tsep"></span>
-          <button class="t-btn" onclick="quickInstr('同意对方的条件，推进合作')">✅ 同意</button>
-          <button class="t-btn" onclick="quickInstr('价格太高了，礼貌地往下砍价')">💰 砍价</button>
+          <button class="t-btn" onclick="quickInstr('推进合作：把我们的产品介绍/brief 链接发给对方，请对方先看一下、再写一个脚本给我们审阅整体制作方向；并说明可接受的付款方式')">🎬 给方向</button>
+          <button class="t-btn" onclick="quickInstr('价格太高了，礼貌地往下砍价：说明我们是一个初创团队、预算有限，能否给我们一个最大的优惠价格')">💰 砍价</button>
           <button class="t-btn" onclick="quickInstr('婉拒这次合作，保持友好，留下以后合作的可能')">🙏 婉拒</button>
-          <button class="t-btn" onclick="quickInstr('询问对方的报价和具体合作形式')">❓ 问价</button>
-          <button class="t-btn" onclick="quickInstr('对方几天没有回复了，写一封轻量友好的跟进提醒：换一个角度补充一个具体的行动点或低门槛的下一步，绝不重复之前说过的话，不催促不施压')">⏰ 跟进</button>
+          <button class="t-btn" onclick="quickInstr('询问对方：制作一个 7–12 分钟的 YouTube 长视频评测，报价是多少')">❓ 问价</button>
+          <button class="t-btn" onclick="quickInstr('帮我跟进这次合作的进展：写一封轻量友好的跟进，补充一个具体的下一步，不重复之前说过的话、不催促不施压')">⏰ 跟进</button>
         </div>
         <div class="chat-tools chat-tools2">
           <button class="t-btn" onclick="openPayment()" title="AI 从对话预填付款申请，照着去飞书「运营推广付款申请」提交">💰 付款申请</button>
