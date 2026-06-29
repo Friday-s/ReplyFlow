@@ -181,28 +181,49 @@ def _send_or_draft(message_id: str, html: str, with_image: bool, image_paths=Non
     return "error", f"{info}（草稿已建好，可去飞书草稿箱发送）"
 
 # ── 收件箱（JSON 格式，含 thread_id / labels） ─────────────────────────────────
-def _triage_json(folder: str, max_n: int = 100) -> list:
-    """+triage --format json → list[{date,from,labels,message_id,subject,thread_id}]"""
-    r = subprocess.run(
-        f"lark-cli mail +triage --as user --max {max_n} --format json "
-        f"--filter '{{\"folder\":\"{folder}\"}}'",
-        shell=True, capture_output=True, text=True
-    )
-    try:
-        data = json.loads(r.stdout)
-        messages = data.get("messages", []) or []
-        for msg in messages:
-            msg.setdefault("from_raw", msg.get("from", ""))
-            msg.setdefault("email", extract_email(msg.get("from", "")) or "")
-        _mail_store.upsert_many(messages, folder=folder)
-        return messages
-    except Exception:
-        return []
+def _cutoff_str(days: int = 10) -> str:
+    """收件箱窗口下界（UTC，"YYYY-MM-DD HH:MM"），与 _build_inbox 的 cutoff 同口径。"""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+
+def _triage_json(folder: str, max_n: int = 100, until_date: str = None, max_pages: int = 10) -> list:
+    """+triage --format json → list[...]。飞书单页封顶 400；until_date 给定时用 page_token
+    翻页累积直到最早一封早于它/无更多页/到 max_pages，确保真覆盖到那个日期而非被单次 400 截断
+    （量大时博主掉出窗口、会话/状态出错的根因）。"""
+    per = min(max(max_n, 1), 400)
+    out, token, capped = [], None, False
+    for pg in range(max_pages):
+        cmd = (f"lark-cli mail +triage --as user --max {per} --format json "
+               f"--filter '{{\"folder\":\"{folder}\"}}'")
+        if token:
+            cmd += f" --page-token '{token}'"
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        try:
+            data = json.loads(r.stdout)
+        except Exception:
+            break
+        msgs = data.get("messages", []) or []
+        for m in msgs:
+            m.setdefault("from_raw", m.get("from", ""))
+            m.setdefault("email", extract_email(m.get("from", "")) or "")
+        out.extend(msgs)
+        token = data.get("page_token")
+        if not until_date or not data.get("has_more") or not token:
+            break
+        oldest = min((m.get("date", "") for m in msgs if m.get("date")), default="")
+        if oldest and oldest[:16] < until_date:
+            break
+        if pg == max_pages - 1:
+            capped = True
+        time.sleep(0.2)
+    _mail_store.upsert_many(out, folder=folder)
+    if capped:
+        print(f"[triage] {folder} 翻页达上限 {max_pages} 页（{len(out)} 封）仍未覆盖到 {until_date}，可能漏更早的")
+    return out
 
 def _scan_sent_threads() -> dict:
     """扫描已发送 → {thread_id: 最新发送时间}。同一会话里我方有更晚消息 = 那封来信已被回复。"""
     threads = {}
-    for msg in _triage_json("SENT", SENT_FETCH_MAX):
+    for msg in _triage_json("SENT", 400, until_date=_cutoff_str(10)):
         tid  = msg.get("thread_id", "")
         date = (msg.get("date") or "")[:16]
         if tid and (tid not in threads or date > threads[tid]):
@@ -219,9 +240,12 @@ _sent_idx_state = {"running": False}
 def _load_sent_idx() -> dict:
     try:
         d = json.loads(SENT_IDX_FILE.read_text())
-        return {"map": d.get("map", {}), "classified": d.get("classified", [])}
+        scanned = d.get("scanned")
+        if scanned is None:   # 旧格式迁移：classified 列表 → 各计 0，下轮按发件数判断是否需重扫
+            scanned = {t: 0 for t in d.get("classified", [])}
+        return {"map": d.get("map", {}), "scanned": scanned}
     except Exception:
-        return {"map": {}, "classified": []}
+        return {"map": {}, "scanned": {}}
 
 def _save_sent_idx(d: dict):
     try:
@@ -230,7 +254,9 @@ def _save_sent_idx(d: dict):
         pass
 
 def _index_sent_threads():
-    """后台：扫 SENT，未分类的线程逐个拉一次，按我方消息的收件人记 email→thread_id。"""
+    """后台：扫 SENT，按「该线程我方发件数」判断是新线程还是长大了，需要时（重新）拉取该线程、
+    按我方消息收件人补登记 email→thread_id。专治：群发大线程一直在长，旧逻辑扫一次就锁死、
+    后续发给新博主的收件人再也补不进来——那些博主一旦掉出收件箱窗口就丢了会话历史。"""
     if _sent_idx_state["running"]:
         return
     _sent_idx_state["running"] = True
@@ -238,19 +264,19 @@ def _index_sent_threads():
     def _run():
         try:
             idx = _load_sent_idx()
-            classified = set(idx.get("classified", []))
+            scanned = idx.get("scanned", {})   # tid → 上次扫描时该线程的「我方发件数」
             mp = idx.get("map", {})
             internal = tuple(d.lower() for d in INTERNAL_DOMAINS)
-            todo = []
-            for m in _triage_json("SENT", SENT_FETCH_MAX):
+            counts = {}
+            for m in _triage_json("SENT", 400, until_date=_cutoff_str(10)):
                 t = m.get("thread_id")
-                if t and t not in classified:
-                    todo.append(t)
-            todo = list(dict.fromkeys(todo))
+                if t:
+                    counts[t] = counts.get(t, 0) + 1
+            todo = [t for t, c in counts.items() if c > scanned.get(t, -1)]
             changed = False
             for n, tid in enumerate(todo, 1):
                 msgs = _get_thread(tid)
-                classified.add(tid); changed = True
+                scanned[tid] = counts[tid]; changed = True
                 for m in (msgs or []):
                     frm = ((m.get("head_from") or {}).get("mail_address") or "").lower()
                     if not frm.endswith(internal):
@@ -262,10 +288,10 @@ def _index_sent_threads():
                             if tid not in lst:
                                 lst.append(tid)
                 if n % 20 == 0:   # 增量落盘 + 刷新缓存，首次大批量时进度不丢、会话逐步补全
-                    _save_sent_idx({"classified": sorted(classified), "map": mp})
+                    _save_sent_idx({"scanned": scanned, "map": mp})
                     _cache["sent_thread_idx"] = mp
             if changed:
-                _save_sent_idx({"classified": sorted(classified), "map": mp})
+                _save_sent_idx({"scanned": scanned, "map": mp})
                 _cache["sent_thread_idx"] = mp
         finally:
             _sent_idx_state["running"] = False
@@ -347,7 +373,7 @@ def _build_inbox():
     # 三个重 IO 并行拉（串行 ~60s → 并行 ≈ 最慢一个）
     res = {}
     def _t1(): res["records"]  = get_all_records()
-    def _t2(): res["messages"] = _triage_json("INBOX", INBOX_FETCH_MAX)
+    def _t2(): res["messages"] = _triage_json("INBOX", 400, until_date=_cutoff_str(10))
     def _t3(): res["sent"]     = _scan_sent_threads()
     ths = [threading.Thread(target=f, daemon=True) for f in (_t1, _t2, _t3)]
     [t.start() for t in ths]
