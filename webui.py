@@ -45,8 +45,8 @@ INTERNAL_DOMAINS = tuple(
               or os.getenv("REPLYDESK_INTERNAL_DOMAINS", "")).split(",")
     if d.strip()
 )
-# 收件箱/已发送一次抓多少封：固定条数撑不住"近 7 天"窗口——GitHub 群发回信量大时，
-# 100 封只覆盖 ~1.5 天，更早回信的博主会被挤掉变「无邮件」。设大些保证盖过 7 天 cutoff。
+# 收件箱/已发送一次抓多少封：飞书 triage 单次硬上限约 400 封。量大时 400 封可能盖不满
+# 近 10 天窗口（早些的会被挤掉变「无邮件」）；量小时 400 封可覆盖十几天。设大无害（仍封顶 400）。
 INBOX_FETCH_MAX  = 600
 SENT_FETCH_MAX   = 600
 EXCLUDE_FROM     = ("mailer-daemon",)   # 仅退信不进列表（退信单独处理→置无法合作）
@@ -70,6 +70,7 @@ def load_state() -> dict:
     raw.setdefault("legacy", {})
     raw.setdefault("farewell", {})   # email → 告别信发出时间（不合适博主的礼貌收尾）
     raw.setdefault("bounces", {})    # 已处理过的退信 message_id → 时间戳（防重复置「无法合作」）
+    raw.setdefault("not_suitable", {})  # email → 标记时间；人工标过「不合适」的博主后续来信一律保持不合适（最高优先级）
     return raw
 
 def save_state(state: dict):
@@ -82,6 +83,32 @@ def mark_farewell(email: str):
     for it in (_cache.get("inbox") or []):
         if it["email"] == email:
             it["farewell_done"] = True
+
+def set_not_suitable(email: str, on: bool):
+    """人工「不合适」标记按 email 记（粘性，跨后续来信生效）。on=False 用于撤销。"""
+    s = load_state()
+    ns = s.setdefault("not_suitable", {})
+    if on:
+        ns[email] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    else:
+        ns.pop(email, None)
+    save_state(s)
+
+def _mark_all_read_for(item: dict) -> int:
+    """把该博主在飞书里所有未读来信都标已读（不止当前这封）。返回标记数。"""
+    email = (item.get("email") or "").lower()
+    tids = set(_email_thread_ids(item.get("email", "")))
+    if item.get("thread_id"):
+        tids.add(item["thread_id"])
+    done = 0
+    for tid in tids:
+        for m in (_get_thread(tid) or []):
+            frm = ((m.get("head_from") or {}).get("mail_address") or "").lower()
+            if frm == email and "UNREAD" in (m.get("label_ids") or []):
+                if mark_email_read(m.get("message_id", "")):
+                    done += 1
+    item["unread"] = False
+    return done
 
 def mark_state(message_id: str, email: str, action: str, draft_url: str = ""):
     """状态按 message_id 存；沟通历史按 email 累积。"""
@@ -331,7 +358,7 @@ def _build_inbox():
     # OWNER 未配置时不过滤（单人/未配置场景显示全部）
     _cache["my_records"] = [r for r in records
                             if r.get("_email") and (not OWNER or OWNER in (r.get("负责人") or ""))]
-    cutoff   = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=10)   # 收件箱窗口：近 10 天
     state    = load_state()
     state_dirty = False
     # 退信处理：把发不到的博主在 Base 里置「无法合作」（在按人归并前，因退信发件人会被 EXCLUDE_FROM 滤掉）
@@ -391,6 +418,10 @@ def _build_inbox():
                 state["history"][email] = state["history"][email][-12:]
                 ms = state["messages"][msg_id]
                 state_dirty = True
+        # 不合适最高优先级：人工标过「不合适」的博主，后续所有来信一律保持不合适，
+        # 盖过双向同步/待处理回潮——对方再来信也不会被打回待处理。
+        if email in state.get("not_suitable", {}):
+            action = "not_suitable"
         rec      = email_map.get(email)
         matched  = rec is not None
         platform = detect_platform(rec.get("_url", "")) if matched else "other"
@@ -1230,6 +1261,7 @@ def api_replies():
                     "send_mode": _send_state["mode"], "auto_sync": _auto_sync,
                     "status_options": get_status_options(),   # 下拉/颜色以飞书该字段为准
                     "my_status_counts": _my_status_counts(),  # 联系状态分组计数（我名下全表，非收件箱）
+                    "my_platform_counts": _my_platform_counts(),  # 平台分组计数（我名下全表）
                     "refreshing": _reload_lock["running"]})
 
 @app.route("/api/search")
@@ -1628,7 +1660,7 @@ def api_payment_draft():
     res_link = (extracted.get("resource_link") or "").strip() or url
     # 规则化字段（代码确定，不靠 AI）
     entity   = "中国大陆" if method == "支付宝" else "中国香港"
-    platform = {"github": "GitHub", "youtube": "YouTube"}.get(item.get("platform"), "")
+    platform = {"github": "GitHub", "youtube": "YouTube", "x": "X"}.get(item.get("platform"), "")
     amt_txt  = f"{amount}{currency}" if amount else ""
     reason   = (f"{platform} KOL合作付款" + (f" {amt_txt}/{period}" if amt_txt else "")).strip()
     if res_link:
@@ -1959,17 +1991,29 @@ def _my_status_counts():
     c["已上线"] = online
     return c
 
+def _my_platform_counts():
+    """我名下全表按平台（主页URL推断）计数，给侧栏「平台」分组用。"""
+    c = {}
+    for r in (_cache.get("my_records") or []):
+        p = detect_platform(r.get("_url", ""))
+        c[p] = c.get(p, 0) + 1
+    return c
+
 @app.route("/api/status-list")
 def api_status_list():
     """按联系状态列出我名下全表的博主（含没邮件往来的）。有邮件往来的复用收件箱富条目（带会话）。"""
     status = (request.args.get("status") or "").strip()
+    plat   = (request.args.get("platform") or "").strip()   # 平台分组：按主页URL推断的平台筛全表
     mine = _cache.get("my_records") or []
     inbox = _cache.get("inbox") or []
     by_email = {(i.get("email") or "").lower(): i for i in inbox}
     gset = _golive_live_set() if status == "已上线" else None
     rows = []
     for r in mine:
-        if status == "已上线":
+        if plat:
+            if detect_platform(r.get("_url", "")) != plat:
+                continue
+        elif status == "已上线":
             if not _is_online(r, gset):
                 continue
         elif _status_text(r.get("联系状态")) != status:
@@ -2439,9 +2483,12 @@ def api_feishu_update():
                 item["feishu"]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
             # 联动本地处理状态：标成不合适 = 这个人不用回了 → 本地也标 ❌；改回其他状态则解除
             if st in ("不合适", "无法合作"):
+                set_not_suitable(item["email"], True)   # 粘性：后续来信也保持不合适（最高优先级）
                 if item.get("action") != "not_suitable":
                     mark_state(mid, item["email"], "not_suitable")
+                threading.Thread(target=_mark_all_read_for, args=(item,), daemon=True).start()  # 全部未读标已读
             elif item.get("action") == "not_suitable":
+                set_not_suitable(item["email"], False)  # 改回其他状态 → 解除粘性
                 mark_state(mid, item["email"], "")
         if myrec is not None:
             myrec["联系状态"] = '["%s"]' % st
@@ -2465,13 +2512,18 @@ def api_mark():
         return jsonify({"ok": False, "error": "not found"})
     feishu_ok = True
     if action == "not_suitable":
+        set_not_suitable(item["email"], True)   # 粘性：后续来信也保持不合适
         if item.get("record_id"):
             feishu_ok = update_feishu_status(item["record_id"], "不合适")
     elif action == "pending":
+        set_not_suitable(item["email"], False)  # 撤销不合适，恢复可处理
         if item.get("action") == "not_suitable" and item.get("record_id"):
             feishu_ok = update_feishu_status(item["record_id"], "沟通中")
     mark_state(message_id, item["email"], action if action != "pending" else "")
-    if action in ("replied", "not_suitable", "ignored") and item.get("unread"):
+    # 不回 / 不合适：把该博主在飞书的全部未读来信都标已读（不止当前这封）
+    if action in ("ignored", "not_suitable"):
+        threading.Thread(target=_mark_all_read_for, args=(item,), daemon=True).start()
+    elif action == "replied" and item.get("unread"):
         def _mk():
             if mark_email_read(message_id):
                 item["unread"] = False
@@ -2511,9 +2563,19 @@ HTML = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box}
 html,body{margin:0;padding:0;height:100%}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;font-size:14px;display:flex;flex-direction:row;overflow:hidden}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:3px}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;font-size:14px;display:flex;flex-direction:row;overflow:hidden;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility;font-variant-numeric:tabular-nums}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--border-2)}
+
+/* ── 质感打磨：物理按压反馈 + 键盘焦点环 + 统一缓动（不改布局/配色/功能） ── */
+.btn,.icon-btn,.sb-chip{transition:all .16s cubic-bezier(.2,.7,.3,1)}
+.btn:active:not(:disabled),.icon-btn:active,.sb-chip:active{transform:translateY(1px)}
+.sb-item:active{transform:translateY(.5px)}
+.mrow:active{background:var(--card-sel)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+.btn:focus-visible,.icon-btn:focus-visible,.sb-item:focus-visible,.sb-chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 /* 飞书邮箱式左侧导航栏 */
 .sidebar{width:208px;flex-shrink:0;background:var(--bg-2);display:flex;flex-direction:column;padding:12px 10px 10px;gap:10px;min-height:0;overflow:hidden}
@@ -2527,12 +2589,19 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 #search:focus{border-color:var(--accent)}
 #sync-info{color:var(--text-3);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sb-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:1px;min-height:0}
-.sb-item{display:flex;align-items:center;gap:7px;padding:6.5px 10px;border-radius:8px;font-size:12.8px;color:var(--text-2);cursor:pointer;transition:background .12s;user-select:none;white-space:nowrap;overflow:hidden}
+.sb-item{display:flex;align-items:center;gap:7px;padding:5px 10px;border-radius:8px;font-size:12.6px;color:var(--text-2);cursor:pointer;transition:background .12s;user-select:none;white-space:nowrap;overflow:hidden}
 .sb-item:hover{background:var(--card)}
 .sb-item.active{background:var(--accent);color:var(--on-accent);font-weight:600}
 .sb-item .cnt{margin-left:auto;font-size:10.5px;color:var(--text-3);font-weight:600}
 .sb-item.active .cnt{color:inherit;opacity:.85}
-.sb-sec{font-size:10.5px;color:var(--text-3);padding:11px 10px 4px;font-weight:600;letter-spacing:.5px}
+.sb-sec{font-size:10.5px;color:var(--text-3);padding:9px 10px 3px;font-weight:600;letter-spacing:.5px}
+/* 平台：压成一排小 chip，省掉 4 行高度 */
+.sb-chips{display:flex;flex-wrap:wrap;gap:5px;padding:1px 8px 2px}
+.sb-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:7px;font-size:12px;line-height:1.4;color:var(--text-2);background:var(--card);border:1px solid var(--border);cursor:pointer;user-select:none;transition:all .12s}
+.sb-chip:hover{border-color:var(--accent);color:var(--accent)}
+.sb-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.sb-chip .cnt{font-size:10px;color:var(--text-3);font-weight:600}
+.sb-chip.active .cnt{color:#fff;opacity:.9}
 .sb-foot{display:flex;flex-direction:column;gap:8px;flex-shrink:0}
 /* 工具区：同步信息单独一行，图标行自动换行——侧栏拖窄/窗口变矮都不再截断最后一个图标 */
 .sb-tools{display:flex;flex-direction:column;align-items:stretch;gap:6px}
@@ -2596,6 +2665,14 @@ body.resizing{user-select:none;cursor:col-resize}
 .mrow-3{display:flex;align-items:center;gap:5px;margin-top:5px;flex-wrap:wrap}
 .badge{display:inline-flex;align-items:center;padding:1.5px 8px;border-radius:5px;font-size:10px;font-weight:600;flex-shrink:0;background:color-mix(in srgb,currentColor 10%,transparent)}
 .b-gh{color:var(--c-gray)} .b-yt{color:var(--c-gray)} .b-other{color:var(--c-gray)}
+.b-x{color:#fff;background:#111;border-color:#111;font-weight:700}
+/* 会话加载骨架（比"加载中…"更有完成感） */
+@keyframes skel-sheen{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.skel-wrap{padding:8px 2px;display:flex;flex-direction:column;gap:14px}
+.skel{background:linear-gradient(90deg,var(--card) 25%,var(--card-hover) 50%,var(--card) 75%);background-size:200% 100%;animation:skel-sheen 1.5s ease-in-out infinite;border-radius:12px}
+.skel-bub{height:52px;width:60%}
+.skel-bub.me{align-self:flex-end;width:46%}
+@media (prefers-reduced-motion:reduce){.skel{animation:none}}
 .b-pending{color:var(--c-amber)} .b-sent{color:var(--c-green)}
 .b-drafted{color:var(--c-indigo)} .b-replied{color:var(--c-blue)} .b-ns{color:var(--c-red)}
 .mrow.dim{opacity:.45}
@@ -2832,6 +2909,13 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
     <div class="sb-item" onclick="setFilter(this,'st_deal')" title="飞书联系状态 = 达成合作">🤝 达成合作<span class="cnt" id="c-st-deal"></span></div>
     <div class="sb-item" onclick="setFilter(this,'st_online')" title="已上线：联系状态=已上线 或 在「上线记录」表里有记录（已从资源库同步）">🚀 已上线<span class="cnt" id="c-st-online"></span></div>
     <div class="sb-item" onclick="setFilter(this,'notice')" title="noreply / no-reply 类自动邮件（平台通知、付款/发票确认等）——单独归这里，不进待处理/全部">🔔 通知<span class="cnt" id="c-notice"></span></div>
+    <div class="sb-sec">平台</div>
+    <div class="sb-chips">
+      <div class="sb-chip" onclick="setFilter(this,'plat_x')" title="X / Twitter（我名下全表）">𝕏<span class="cnt" id="c-plat-x"></span></div>
+      <div class="sb-chip" onclick="setFilter(this,'plat_youtube')" title="YouTube（我名下全表）">▶<span class="cnt" id="c-plat-youtube"></span></div>
+      <div class="sb-chip" onclick="setFilter(this,'plat_github')" title="GitHub（我名下全表）">🐙<span class="cnt" id="c-plat-github"></span></div>
+      <div class="sb-chip" onclick="setFilter(this,'plat_other')" title="其它 / 无主页URL（我名下全表）">🔗<span class="cnt" id="c-plat-other"></span></div>
+    </div>
   </div>
   <div class="sb-foot">
     <button class="btn btn-send btn-sm" id="pending-btn" onclick="openReview()" style="display:none;width:100%;justify-content:center">📬 待发送审核 (0)</button>
@@ -3076,6 +3160,7 @@ async function loadReplies(force=false){
     if(d.owner!==undefined) _OWNER = d.owner||'';
     if(d.status_options && d.status_options.length) STATUS_OPTIONS = d.status_options;
     _myStatusCounts = d.my_status_counts || _myStatusCounts;
+  _myPlatformCounts = d.my_platform_counts || _myPlatformCounts;
     updateStats(d.stats||{});
     if(d.auto_sync && d.auto_sync.last){
       const si = document.getElementById('sync-info');
@@ -3122,6 +3207,10 @@ function updateStats(s){
   set('c-st-talking',   _myStatusCounts['沟通中']||0);
   set('c-st-deal',      _myStatusCounts['达成合作']||0);
   set('c-st-online',    _myStatusCounts['已上线']||0);
+  set('c-plat-x',       _myPlatformCounts['x']||0);        // 平台分组（全表口径）
+  set('c-plat-youtube', _myPlatformCounts['youtube']||0);
+  set('c-plat-github',  _myPlatformCounts['github']||0);
+  set('c-plat-other',   _myPlatformCounts['other']||0);
   set('c-coop',   allItems.filter(i=>/达成合作|推进制作/.test(i.feishu_status||'')).length);
   set('c-farewell',allItems.filter(i=>/不合适|无法合作/.test(i.feishu_status||'') && i.action!=='not_suitable' && !i.farewell_done).length);
   set('c-followup',allItems.filter(i=>i.followup).length);
@@ -3139,21 +3228,25 @@ function calcStats(){
 }
 
 /* ── 列表 ── */
-let _myStatusCounts={}, _statusItems=[];
+let _myStatusCounts={}, _myPlatformCounts={}, _statusItems=[];
 const STATUS_FILTERS={st_contacted:'已联系',st_talking:'沟通中',st_deal:'达成合作',st_online:'已上线'};
+const PLATFORM_FILTERS={plat_x:'x',plat_youtube:'youtube',plat_github:'github',plat_other:'other'};
+const PLATFORM_LABEL={x:'𝕏',youtube:'YouTube',github:'GitHub',other:'其他'};
 function setFilter(btn,f){
   currentFilter=f;
-  document.querySelectorAll('.sb-item').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.sb-item,.sb-chip').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
-  if(STATUS_FILTERS[f]) loadStatusList(f);   // 联系状态分组：读飞书全表（含没邮件往来的）
+  if(STATUS_FILTERS[f]||PLATFORM_FILTERS[f]) loadStatusList(f);   // 联系状态/平台分组：读飞书全表（含没邮件往来的）
   else renderList();
 }
 async function loadStatusList(f){
-  const status=STATUS_FILTERS[f];
+  const isPlat=!!PLATFORM_FILTERS[f];
+  const val=isPlat?PLATFORM_FILTERS[f]:STATUS_FILTERS[f];
+  const label=isPlat?PLATFORM_LABEL[val]:val;
   const el=document.getElementById('maillist');
-  el.innerHTML='<p class="empty">⟳ 读飞书全表（'+status+'）…</p>';
+  el.innerHTML='<p class="empty">⟳ 读飞书全表（'+label+'）…</p>';
   try{
-    const r=await fetch('/api/status-list?status='+encodeURIComponent(status));
+    const r=await fetch('/api/status-list?'+(isPlat?'platform':'status')+'='+encodeURIComponent(val));
     const d=await r.json();
     _statusItems=(d.ok && currentFilter===f)?(d.items||[]):[];
   }catch(e){ _statusItems=[]; }
@@ -3184,7 +3277,7 @@ function needsReply(i){
 function isReviewing(i){ return !i.action && /需审核/.test(i.feishu_status||''); }
 function filteredItems(){
   const f = currentFilter;
-  if(STATUS_FILTERS[f]) return _statusItems;   // 联系状态分组：服务端已按「我名下全表 + 该状态」过滤好
+  if(STATUS_FILTERS[f]||PLATFORM_FILTERS[f]) return _statusItems;   // 联系状态/平台分组：服务端已按「我名下全表」过滤好
   // noreply 类通知只在「🔔 通知」分组出现，其余所有视图（含全部）都排除，避免淹没主区
   let items = (f==='notice') ? allItems.filter(i=>i.is_notice) : allItems.filter(i=>!i.is_notice);
   if(f==='notice')        items=[...items];
@@ -3251,6 +3344,7 @@ function intentBadge(it){
 function platformBadge(p, matched){
   if(p==='youtube') return '<span class="badge b-yt">YouTube</span>';
   if(p==='github')  return '<span class="badge b-gh">GitHub</span>';
+  if(p==='x')       return '<span class="badge b-x">𝕏</span>';
   return '<span class="badge b-other">'+(matched?'其他':'未入库')+'</span>';
 }
 function actionBadge(a){
@@ -3478,7 +3572,7 @@ async function openItem(mid){
   }
 
   document.getElementById('p-date').textContent='';
-  document.getElementById('p-incoming').innerHTML='<span style="color:var(--text-3);font-size:12px">加载中...</span>';
+  document.getElementById('p-incoming').innerHTML='<div class="skel-wrap"><div class="skel skel-bub"></div><div class="skel skel-bub me"></div><div class="skel skel-bub"></div></div>';
   _convDlg=[]; _convMid=''; _convTransOn=false; _convTransLoaded=false;   // 重置上一封的翻译状态
   { const tb=document.getElementById('conv-trans-btn'); if(tb) tb.textContent='🌐 翻译'; }
 
@@ -3638,8 +3732,8 @@ async function fcardStatus(mid, sel){
       if(it){
         it.feishu_status=d.feishu_status;
         if(it.feishu){ it.feishu.status=sel.value; }
-        // 联动本地徽章：不合适/无法合作 → ❌；改回其他 → 解除
-        if(/不合适|无法合作/.test(sel.value)) it.action='not_suitable';
+        // 联动本地徽章：不合适/无法合作 → ❌ + 清未读；改回其他 → 解除
+        if(/不合适|无法合作/.test(sel.value)){ it.action='not_suitable'; it.unread=false; }
         else if(it.action==='not_suitable') it.action='';
       }
       updateStats(calcStats()); renderList();
@@ -3980,6 +4074,7 @@ async function doMark(mid, action){
   if(d.ok){
     const item = allItems.find(i=>i.message_id===mid);
     if(item){ item.action = action==='pending'?'':action;
+      if(action==='ignored'||action==='not_suitable') item.unread=false;   // 不回/不合适 → 立刻清未读
       item.action_ts=new Date().toLocaleString('zh'); }
     _selected.delete(mid); updateBatchBtn();
     updateStats(calcStats()); renderList();
