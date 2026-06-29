@@ -2998,6 +2998,7 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
           <span class="tsep"></span>
           <button class="t-btn" onclick="quickInstr('推进合作：把我们的产品介绍/brief 链接发给对方，请对方先看一下、再写一个脚本给我们审阅整体制作方向；并说明可接受的付款方式')">🎬 给方向</button>
           <button class="t-btn" onclick="quickInstr('价格太高了，礼貌地往下砍价：说明我们是一个初创团队、预算有限，能否给我们一个最大的优惠价格')">💰 砍价</button>
+          <button class="t-btn" onclick="quickInstr('继续往下砍价（软性施压版）：表达我们非常希望与对方合作、我个人也在尽力帮对方争取这个价格，只是公司上级给的预算很紧张，恳请对方再给一个更优惠的价格')">💰 砍价2</button>
           <button class="t-btn" onclick="quickInstr('婉拒这次合作，保持友好，留下以后合作的可能')">🙏 婉拒</button>
           <button class="t-btn" onclick="quickInstr('询问对方：制作一个 7–12 分钟的 YouTube 长视频评测，报价是多少')">❓ 问价</button>
           <button class="t-btn" onclick="quickInstr('帮我跟进这次合作的进展：写一封轻量友好的跟进，补充一个具体的下一步，不重复之前说过的话、不催促不施压')">⏰ 跟进</button>
