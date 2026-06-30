@@ -40,6 +40,15 @@ def _save_repo_disk_cache(cache: dict):
 BASE_TOKEN   = _cfg("BASE_TOKEN")
 TABLE_ID     = _cfg("TABLE_ID")
 FROM_ADDRESS = _cfg("FROM_ADDRESS")
+# ── Optional second data source: a Feishu table that already pairs an email column
+# (联系方式) with a profile URL (X账号). When configured, its active rows are merged
+# into the inbox-matching set. Field names below are this app's expected schema for
+# that table (generic Feishu column names, not secrets). Leave the env vars empty to
+# disable — get_x_records() then becomes a no-op.
+X_BASE_TOKEN = _cfg("X_BASE_TOKEN")
+X_TABLE_ID   = _cfg("X_TABLE_ID")
+# Only load "active + has email" rows; rows whose 当前状态 is one of these are skipped.
+X_DEAD_STATUS = {"无法合作", "不合适", "不推进", "不通过"}
 OWNER        = _cfg("OWNER")   # 共享团队表里"我负责的行"的人名；为空=不按负责人过滤（单人/独立表）
 VAULT_ROOT   = Path(_cfg("VAULT_ROOT", str(Path.cwd())))
 BLOOME_IMG   = Path(_cfg("BLOOME_IMG", str(Path.home() / "Downloads/bloome.png")))
@@ -132,7 +141,67 @@ def get_all_records() -> list:
     for r in all_rows:
         r["_email"] = extract_email(r.get("联系方式", ""))
         r["_url"]   = extract_url(r.get("主页URL", ""))
+        # 路由标记：写回（状态/备注）时按记录自带的表/字段走，而非硬编码主表
+        r["_source"]       = "main"
+        r["_base"]         = BASE_TOKEN
+        r["_table"]        = TABLE_ID
+        r["_status_field"] = "联系状态"
+        r["_note_field"]   = "备注（报价、合作形式等）"
     return all_rows
+
+def get_x_records() -> list:
+    """第二数据源（X 红人联系池等）→ 归一化成主表口径的记录列表，供邮件匹配/状态跟进。
+    未配置 X_BASE_TOKEN/X_TABLE_ID 时直接返回空（no-op）。
+    只取「活跃 + 有邮箱」的；字段别名：当前状态→联系状态、X账号→主页URL/_url、备注→备注（报价…）。
+    带 _source='x' 及自带 base/table/状态字段名，写回时路由到该表的「当前状态」。"""
+    if not (X_BASE_TOKEN and X_TABLE_ID):
+        return []
+    out, offset = [], 0
+    while True:
+        d = _run_json(
+            f"lark-cli base +record-list "
+            f"--base-token {X_BASE_TOKEN} --table-id {X_TABLE_ID} "
+            f"--limit 200 --offset {offset} --as user --format json"
+        )
+        dat = (d or {}).get("data") or {}
+        fields = dat.get("fields") or []
+        rows   = dat.get("data") or []
+        rid_list = dat.get("record_id_list") or []
+        if not rows:
+            break
+        idx = {name: i for i, name in enumerate(fields)}
+        def _cell(row, name):
+            i = idx.get(name, -1)
+            return row[i] if 0 <= i < len(row) else ""
+        for row, rid in zip(rows, rid_list):
+            email = extract_email(str(_cell(row, "联系方式") or ""))
+            if not email:
+                continue                                   # 没邮箱 → 不走邮件，跳过
+            status_raw = str(_cell(row, "当前状态") or "")
+            if any(s in status_raw for s in X_DEAD_STATUS):
+                continue                                   # 已黄/已结束 → 不进收件箱匹配
+            x_url = extract_url(str(_cell(row, "X账号") or ""))
+            out.append({
+                "_email":        email,
+                "_url":          x_url,
+                "_record_id":    rid,
+                "_source":       "x",
+                "_base":         X_BASE_TOKEN,
+                "_table":        X_TABLE_ID,
+                "_status_field": "当前状态",
+                "_note_field":   "备注",
+                # 别名成主表口径，复用现有展示/分组/统计逻辑
+                "联系状态":       status_raw,
+                "主页URL":        str(_cell(row, "X账号") or ""),
+                "备注（报价、合作形式等）": str(_cell(row, "备注") or ""),
+                "语种":           str(_cell(row, "语种") or ""),
+                "_record_id_raw": rid,
+            })
+        if not dat.get("has_more"):
+            break
+        offset += 200
+        time.sleep(0.4)
+    return out
 
 def get_active_records() -> list:
     """仅「已联系 / 沟通中」的记录（旧接口，run.py/app.py 仍在用）。"""

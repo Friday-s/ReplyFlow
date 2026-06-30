@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 from core import (
-    get_all_records, detect_platform, get_github_handle,
+    get_all_records, get_x_records, detect_platform, get_github_handle,
     extract_email, analyze_github_repos,
     update_status, _run_text, _run_json,
     preview_github_text, preview_github_text_zh,
@@ -25,7 +25,7 @@ from core import (
     preview_generic_text, preview_generic_text_zh,
     _plain_to_html, _create_reply_draft_opt,
     send_reply_direct, send_draft, mark_email_read,
-    BASE_TOKEN, TABLE_ID, FROM_ADDRESS, OWNER,
+    BASE_TOKEN, TABLE_ID, FROM_ADDRESS, OWNER, _cfg,
 )
 from mail_store import APP_DATA_DIR, MailStore
 
@@ -237,6 +237,39 @@ def _scan_sent_threads() -> dict:
 SENT_IDX_FILE = APP_DATA_DIR / "sent-threads.json"
 _sent_idx_state = {"running": False}
 
+# ── peer 级发件时间索引：email → 我最后一次发给这个人的时间（独立文件，防与发件线程索引写竞争）──
+# 来源是「会话视图已暖好的双方往来」（我方最后发言的时间），零额外 API；持久化供重启后 build 立即可用。
+# 它是判断「这封来信我到底回没回」的可靠依据，取代旧的 thread 级猜测（群发共享 thread 会误伤）。
+SENT_AT_FILE = APP_DATA_DIR / "peer-sent.json"
+_sent_at_lock = threading.Lock()
+_sent_at_save = {"dirty": False, "last": 0.0}
+
+def _load_sent_at() -> dict:
+    try:
+        return json.loads(SENT_AT_FILE.read_text()) or {}
+    except Exception:
+        return {}
+
+def _record_peer_sent(email: str, date16: str):
+    """记下「我发给这个人的最晚时间」（date16 = 'YYYY-MM-DD HH:MM'）。只增不减、节流落盘。"""
+    if not email or not date16:
+        return
+    em = email.lower()
+    idx = _cache.setdefault("sent_at_idx", {})
+    if date16 > idx.get(em, ""):
+        idx[em] = date16
+        _sent_at_save["dirty"] = True
+    # 节流：最多每 20s 落盘一次，避免每次请求都写
+    now = time.time()
+    if _sent_at_save["dirty"] and now - _sent_at_save["last"] > 20:
+        with _sent_at_lock:
+            try:
+                SENT_AT_FILE.write_text(json.dumps(idx, ensure_ascii=False))
+                _sent_at_save["dirty"] = False
+                _sent_at_save["last"] = now
+            except Exception:
+                pass
+
 def _load_sent_idx() -> dict:
     try:
         d = json.loads(SENT_IDX_FILE.read_text())
@@ -277,16 +310,19 @@ def _index_sent_threads():
             for n, tid in enumerate(todo, 1):
                 msgs = _get_thread(tid)
                 scanned[tid] = counts[tid]; changed = True
+                md = ""
                 for m in (msgs or []):
                     frm = ((m.get("head_from") or {}).get("mail_address") or "").lower()
                     if not frm.endswith(internal):
-                        continue   # 只看我方发出的消息，取其收件人
+                        continue   # 只看我方发出的消息，取其收件人 + 发送时间
+                    md = (m.get("date_formatted") or "")[:16]
                     for t in (m.get("to") or []):
                         em = ((t or {}).get("mail_address") or "").lower()
                         if em and not em.endswith(internal):
                             lst = mp.setdefault(em, [])
                             if tid not in lst:
                                 lst.append(tid)
+                            _record_peer_sent(em, md)   # 顺手把 peer 级发件时间也补上
                 if n % 20 == 0:   # 增量落盘 + 刷新缓存，首次大批量时进度不丢、会话逐步补全
                     _save_sent_idx({"scanned": scanned, "map": mp})
                     _cache["sent_thread_idx"] = mp
@@ -320,6 +356,7 @@ def _feishu_profile(rec) -> dict:
     return {
         "status":  _clean_multi(rec.get("联系状态")),
         "tags":    _clean_multi(rec.get("标签")),
+        "price":   str(rec.get("最终成交价") or "").strip(),   # 锁定成交价（可在档案卡编辑）
         "coop":    _clean_multi(rec.get("合作形式")),
         "lang":    _clean_multi(rec.get("语种")),
         "country": _clean_multi(rec.get("国家")),
@@ -361,6 +398,21 @@ def load_data(force=False):
     finally:
         _reload_lock["running"] = False
 
+def _get_x_records_cached():
+    """第二数据源（X 红人池等）记录（活跃+有邮箱），带 30 分钟 TTL——该表条目多、变化慢，
+    避免每次 build 都全表分页读（10+ 次 API）。未配置则返回空；读失败回退上次缓存，绝不拖垮主流程。"""
+    now = time.time()
+    if _cache.get("x_records") is not None and now - _cache.get("x_records_ts", 0) < 1800:
+        return _cache["x_records"]
+    try:
+        xr = get_x_records()
+    except Exception as e:
+        print(f"[x-records] 读取失败，沿用旧缓存: {e}")
+        xr = _cache.get("x_records") or []
+    _cache["x_records"] = xr
+    _cache["x_records_ts"] = now
+    return xr
+
 def _build_inbox():
     _old_snippets = {i["message_id"]: i["snippet"]
                      for i in (_cache.get("inbox") or []) if i.get("snippet")}
@@ -370,23 +422,36 @@ def _build_inbox():
         _sent_optimistic[_e] = [s for s in _sent_optimistic[_e] if s["ts"] > _cut]
         if not _sent_optimistic[_e]:
             del _sent_optimistic[_e]
-    # 三个重 IO 并行拉（串行 ~60s → 并行 ≈ 最慢一个）
+    # 两个重 IO 并行拉（串行 ~60s → 并行 ≈ 最慢一个）。
+    # 注：旧的「扫 SENT 取 thread 级最新发件时间」(_t3) 已废弃——它正是群发误判的根源，
+    # 现在「我回没回某人」改由 peer 级发件索引（运行时从暖好的双方往来回填）判断，少一次 SENT triage。
     res = {}
     def _t1(): res["records"]  = get_all_records()
     def _t2(): res["messages"] = _triage_json("INBOX", 400, until_date=_cutoff_str(10))
-    def _t3(): res["sent"]     = _scan_sent_threads()
+    def _t3(): res["x"]        = _get_x_records_cached()   # 第二数据源（30min TTL，仅刷新时真读）
     ths = [threading.Thread(target=f, daemon=True) for f in (_t1, _t2, _t3)]
     [t.start() for t in ths]
     [t.join()  for t in ths]
-    records, messages, sent_threads = res.get("records") or [], res.get("messages") or [], res.get("sent") or {}
+    records, messages = res.get("records") or [], res.get("messages") or []
+    # 并入第二数据源（X 红人池等）。主表优先：只补主表没有的邮箱（同一博主一般只在一张表，重叠极少）
+    main_emails = {r["_email"] for r in records if r.get("_email")}
+    records = records + [r for r in (res.get("x") or [])
+                         if r.get("_email") and r["_email"] not in main_emails]
     email_map = {r["_email"]: r for r in records if r.get("_email")}
-    # 缓存「我（OWNER）名下、有邮箱」的全部记录 → 供联系状态分组按飞书全表列博主
-    # OWNER 未配置时不过滤（单人/未配置场景显示全部）
+    # 缓存「我（OWNER）名下、有邮箱」的全部记录 → 供联系状态分组按飞书全表列博主。
+    # 第二数据源（X 来源）没有「负责人」字段 → 一律计入（用户主动选了把它当第二来源）。
     _cache["my_records"] = [r for r in records
-                            if r.get("_email") and (not OWNER or OWNER in (r.get("负责人") or ""))]
+                            if r.get("_email") and (r.get("_source") == "x"
+                                                    or not OWNER or OWNER in (r.get("负责人") or ""))]
     cutoff   = datetime.now(timezone.utc) - timedelta(days=10)   # 收件箱窗口：近 10 天
     state    = load_state()
     state_dirty = False
+    # peer 级发件时间索引（持久化、重启即可用）：email → 我最后发给他的时间。
+    # 来源是会话视图暖好的双方往来（运行时回填），不靠 thread 级猜测，群发共享线程不会误伤。
+    _sent_at_idx = _cache.get("sent_at_idx")
+    if _sent_at_idx is None:
+        _sent_at_idx = _load_sent_at()
+        _cache["sent_at_idx"] = _sent_at_idx
     # 退信处理：把发不到的博主在 Base 里置「无法合作」（在按人归并前，因退信发件人会被 EXCLUDE_FROM 滤掉）
     try:
         _process_bounces(messages, email_map, state)
@@ -431,19 +496,18 @@ def _build_inbox():
             state_dirty = True
         ms = ms or {}
         action = ms.get("action", "")
-        # ── 双向同步：同一会话线程里我方有更晚的发件 → 这封视为已回复 ──
+        # 旧版按 thread 级猜出来、还写进了硬盘的"已回复"（几乎全是群发误伤）一律忽略，
+        # 下面按 peer 级重新派生——顺手清掉历史污染，这种推断从此不再持久化。
+        if action == "replied":
+            action = ""
+        # ── 双向同步（peer 级 · 纯派生不持久化）：我确实在这个人来信之后单独回过他 → 视为已回复、移出待处理 ──
+        # 关键修复：旧逻辑用 sent_threads[thread_id]（thread 级）。群发几十个博主共用一个 thread_id，
+        # 我给其中任意一人发信、时间比某人来信晚，就会把整条 thread 里"没单独回的人"误标已回复而从待处理消失。
+        # 现在只认「我发给这个 email 本人」的最晚时间；没有该数据时一律保持待处理（宁可多显示，绝不误藏）。
         if action in ("", "drafted"):
-            sent_at = sent_threads.get(msg.get("thread_id", ""), "")
-            if sent_at and sent_at > msg["date"][:16]:
+            peer_sent = _sent_at_idx.get(email.lower(), "")
+            if peer_sent and peer_sent > msg["date"][:16]:
                 action = "replied"
-                state["messages"][msg_id] = {
-                    "action": "replied", "draft_url": ms.get("draft_url", ""),
-                    "ts": sent_at, "email": email}
-                state["history"].setdefault(email, []).append(
-                    {"action": "replied", "ts": sent_at})
-                state["history"][email] = state["history"][email][-12:]
-                ms = state["messages"][msg_id]
-                state_dirty = True
         # 不合适最高优先级：人工标过「不合适」的博主，后续所有来信一律保持不合适，
         # 盖过双向同步/待处理回潮——对方再来信也不会被打回待处理。
         if email in state.get("not_suitable", {}):
@@ -467,6 +531,12 @@ def _build_inbox():
             "record_id":  rec.get("_record_id", "") if matched else "",
             "note":       rec.get("备注（报价、合作形式等）", "") if matched else "",
             "feishu":     _feishu_profile(rec) if matched else None,
+            # 写回路由：状态/备注按记录自带的表与字段走（X 来源 → X 表的「当前状态」/「备注」）
+            "src":          rec.get("_source", "main") if matched else "main",
+            "_base":        rec.get("_base", BASE_TOKEN) if matched else BASE_TOKEN,
+            "_table":       rec.get("_table", TABLE_ID) if matched else TABLE_ID,
+            "_status_field": rec.get("_status_field", "联系状态") if matched else "联系状态",
+            "_note_field":  rec.get("_note_field", "备注（报价、合作形式等）") if matched else "备注（报价、合作形式等）",
             "action":     action,
             "draft_url":  ms.get("draft_url", ""),
             "action_ts":  ms.get("ts", ""),
@@ -484,6 +554,8 @@ def _build_inbox():
     _cache["inbox"]   = inbox
     _cache["ts"]      = time.time()
     _cache["sent_thread_idx"] = _load_sent_idx().get("map", {})   # 先用已持久化的发件索引
+    if "sent_at_idx" not in _cache:                               # peer 级发件时间（独立文件，别被覆盖）
+        _cache["sent_at_idx"] = _load_sent_at()
     _warm_threads_async(inbox)   # 后台回热线程缓存 + 补摘要/意图（~1 分钟内恢复）
     _index_sent_threads()        # 后台：把只发件未回信的线程按收件人补进索引（增量、自愈）
     return inbox
@@ -546,7 +618,8 @@ def _warm_threads_async(inbox):
                         if rid and "联系邮箱" not in note:
                             tag = f"联系邮箱：{contact}（抄送回复）"
                             new = tag if not note.strip() else note + "<br>" + tag
-                            if update_feishu_note(rid, new):
+                            _rt = _route_of(it)
+                            if update_feishu_note(rid, new, _rt["note_field"], _rt["base"], _rt["table"]):
                                 it["note"] = new
                 except Exception:
                     pass
@@ -555,13 +628,16 @@ def _warm_threads_async(inbox):
 
     threading.Thread(target=_run, daemon=True).start()
 
-def _feishu_patch(record_id: str, patch: dict) -> bool:
-    """写回飞书表（失败自动重试一次——连续快速写入偶发瞬时失败）。"""
+def _feishu_patch(record_id: str, patch: dict, base: str = None, table: str = None) -> bool:
+    """写回飞书表（失败自动重试一次——连续快速写入偶发瞬时失败）。
+    base/table 缺省=主表；传入则路由到该表（X 红人池等第二数据源）。"""
+    base = base or BASE_TOKEN
+    table = table or TABLE_ID
     payload = json.dumps({"record_id_list": [record_id], "patch": patch})
     for attempt in (1, 2):
         r = subprocess.run(
-            f"lark-cli base +record-batch-update --base-token {BASE_TOKEN} "
-            f"--table-id {TABLE_ID} --as user --json '{payload}'",
+            f"lark-cli base +record-batch-update --base-token {base} "
+            f"--table-id {table} --as user --json '{payload}'",
             shell=True, capture_output=True, text=True
         )
         if r.returncode == 0:
@@ -569,11 +645,22 @@ def _feishu_patch(record_id: str, patch: dict) -> bool:
         time.sleep(1.2)
     return False
 
-def update_feishu_status(record_id: str, new_status: str) -> bool:
-    return _feishu_patch(record_id, {"联系状态": new_status})
+def update_feishu_status(record_id: str, new_status: str,
+                         field: str = "联系状态", base: str = None, table: str = None) -> bool:
+    return _feishu_patch(record_id, {field: new_status}, base, table)
 
-def update_feishu_note(record_id: str, note: str) -> bool:
-    return _feishu_patch(record_id, {"备注（报价、合作形式等）": note})
+def update_feishu_note(record_id: str, note: str,
+                       field: str = "备注（报价、合作形式等）", base: str = None, table: str = None) -> bool:
+    return _feishu_patch(record_id, {field: note}, base, table)
+
+def _route_of(item: dict) -> dict:
+    """从收件箱 item 取写回路由（表/状态字段/备注字段）。缺省回主表，保证旧调用不受影响。"""
+    return {
+        "base":  item.get("_base", BASE_TOKEN),
+        "table": item.get("_table", TABLE_ID),
+        "status_field": item.get("_status_field", "联系状态"),
+        "note_field":   item.get("_note_field", "备注（报价、合作形式等）"),
+    }
 
 # ── 退信处理：识别退信 → 解析失败收件人 → 对应记录置「无法合作」 ───────────────────
 _BOUNCE_FROM = ("mailer-daemon", "postmaster", "mail-daemon", "mail delivery",
@@ -615,13 +702,14 @@ def _parse_bounce_reasons(body: str) -> dict:
 
 def _append_bounce_note(rec: dict, rid: str, reason: str):
     """把退信原因写进备注（已写过则跳过；有正文则换行追加，不覆盖报价/链接）。"""
-    NF = "备注（报价、合作形式等）"
+    NF = "备注（报价、合作形式等）"   # 本地缓存统一用主表口径键（X 记录也别名成了这个）
+    nf_remote = rec.get("_note_field", NF)   # 实际写飞书的字段名（X → "备注"）
     old = (rec.get(NF) or "").strip()
     if "退信" in old:
         return
     tag  = "退信：" + reason
     note = tag if (not old or old == reason or reason in old) else old + "<br>" + tag
-    if update_feishu_note(rid, note):
+    if update_feishu_note(rid, note, nf_remote, rec.get("_base", BASE_TOKEN), rec.get("_table", TABLE_ID)):
         rec[NF] = note
 
 def _process_bounces(messages: list, email_map: dict, state: dict) -> dict:
@@ -652,8 +740,11 @@ def _process_bounces(messages: list, email_map: dict, state: dict) -> dict:
                 orig_email, rec = lower_map[fe]
                 rid = rec.get("_record_id")
                 cur = rec.get("联系状态") or ""
+                # 路由：X 来源退信 → 写 X 表「当前状态=无法合作」（该选项两表都有）
+                _rb, _rt_t = rec.get("_base", BASE_TOKEN), rec.get("_table", TABLE_ID)
+                _rsf = rec.get("_status_field", "联系状态")
                 if rid and "无法合作" not in cur and "不合适" not in cur:
-                    if update_feishu_status(rid, "无法合作"):
+                    if update_feishu_status(rid, "无法合作", _rsf, _rb, _rt_t):
                         hits[orig_email] = rid
                         rec["联系状态"] = '["无法合作"]'   # 同步本地缓存，rebuild 也会再读
                 # 把退信原因记进备注（粘原文式，已记过则跳过）
@@ -1170,9 +1261,10 @@ def _classify_intent(last_peer_text: str) -> dict:
         "你在帮 KOL 商务负责人快速分诊邮件。对方（创作者）最新一封邮件内容：\n\n"
         + last_peer_text[:600] +
         "\n\n判断对方当前意图，只输出一行 JSON（不要解释）："
-        '{"label":"同意|报价|提问|拒绝|待回应|寒暄","price":"对方提到的报价（如 250rmb/月、$100/once），没提则空"}\n'
+        '{"label":"同意|报价|提问|拒绝|待回应|寒暄|交付","price":"对方提到的报价（如 250rmb/月、$100/once），没提则空"}\n'
         "说明：同意=接受合作/价格；报价=提出或讨论价格；提问=有具体问题等我答；"
-        "拒绝=明确不合作；待回应=在等我方下一步；寒暄=无实质内容。"
+        "拒绝=明确不合作；待回应=在等我方下一步；寒暄=无实质内容；"
+        "交付=对方发来了脚本/大纲/初稿/草稿/已上线内容等待我审阅确认。"
     )
     out = {"label": "", "price": ""}
     try:
@@ -1213,7 +1305,8 @@ def _status_sync_once():
             continue
         st = item.get("feishu_status") or ""
         if "待联系" in st or "已联系" in st:
-            if update_feishu_status(item["record_id"], "沟通中"):
+            _rt = _route_of(item)   # X 来源 → 推进 X 表「当前状态」("沟通中"两表都有)
+            if update_feishu_status(item["record_id"], "沟通中", _rt["status_field"], _rt["base"], _rt["table"]):
                 item["feishu_status"] = '["沟通中"]'
                 n += 1
             time.sleep(0.4)
@@ -1255,12 +1348,20 @@ def api_replies():
                 c = _translate_cache.get(_intent_key(pm[-1]["text"]))
                 if isinstance(c, dict):
                     item["intent"] = c
-            # 矫正：按「这个博主自己的往来」判断——对方说了最后一句话 = 球在我这 = 待处理。
-            # 关键：msgs 已按本博主过滤，群发共享线程里「我发给别人」的发件不会算进来，
-            # 所以不会再把"没回的人"误判成已回复（旧逻辑用线程级时间戳比较，会被同线程他人发件污染）。
-            if item.get("action") in ("sent", "drafted", "replied") and msgs \
-                    and msgs[-1]["role"] == "对方":
-                item["action"] = ""
+            # 矫正：按「这个博主自己的往来」（已按本博主过滤，群发里我发给别人的不算）判断球在谁手里。
+            # 对方说了最后一句 = 球在我这 = 待处理；我说了最后一句 = 我在等他回 = 不算待处理。
+            # 这是缓存暖好后的权威判定，并把「我发给这个人的最晚时间」回填进 peer 级索引、持久化，
+            # 让下次冷启动 build 不必等缓存预热就能正确判断（彻底取代旧的 thread 级猜测）。
+            if msgs:
+                if msgs[-1]["role"] == "对方":
+                    if item.get("action") in ("sent", "drafted", "replied"):
+                        item["action"] = ""          # 打回待处理
+                elif msgs[-1]["role"] == "我":
+                    if not item.get("action"):
+                        item["action"] = "replied"   # 派生（不写状态），移出待处理
+                    _mine = [p for p in msgs if p["role"] == "我"]
+                    if _mine and _mine[-1].get("date"):
+                        _record_peer_sent(item["email"], _mine[-1]["date"])
             # 二轮待回：我参与过对话、对方又回来了（批量处理谈判轮的精准筛选）
             if not item.get("action") and msgs:
                 item["round2"] = any(p["role"] == "我" for p in msgs)
@@ -1268,11 +1369,17 @@ def api_replies():
             if item.get("action") in ("sent", "replied") and msgs:
                 item["followup"] = False
                 if msgs[-1]["role"] == "我":
-                    try:
-                        dt = datetime.strptime(msgs[-1]["date"], "%Y-%m-%d %H:%M")
-                        item["followup"] = (datetime.now() - dt) >= timedelta(hours=24)
-                    except Exception:
-                        pass
+                    # 用 internal_date（epoch 毫秒，无时区歧义）算"距上次我方发言多久"——
+                    # 旧逻辑拿 date 字符串当本地时间和 datetime.now() 比，与 cutoff 的 UTC 口径不一致、会差 8h
+                    ts_ms = (msgs[-1].get("sort") or (0,))[0]
+                    if ts_ms:
+                        item["followup"] = (time.time() * 1000 - ts_ms) >= 24 * 3600 * 1000
+                    else:
+                        try:
+                            dt = datetime.strptime(msgs[-1]["date"], "%Y-%m-%d %H:%M")
+                            item["followup"] = (datetime.now() - dt) >= timedelta(hours=24)
+                        except Exception:
+                            pass
         except Exception:
             pass
     stats = {
@@ -1287,6 +1394,7 @@ def api_replies():
     return jsonify({"ok": True, "stats": stats, "items": inbox, "owner": OWNER,
                     "send_mode": _send_state["mode"], "auto_sync": _auto_sync,
                     "status_options": get_status_options(),   # 下拉/颜色以飞书该字段为准
+                    "tag_options": get_tag_options(),          # 标签可编辑下拉（multi_select，已去重）
                     "my_status_counts": _my_status_counts(),  # 联系状态分组计数（我名下全表，非收件箱）
                     "my_platform_counts": _my_platform_counts(),  # 平台分组计数（我名下全表）
                     "refreshing": _reload_lock["running"]})
@@ -1435,6 +1543,25 @@ def api_translate_texts():
         return jsonify({"ok": False, "error": "no texts"})
     return jsonify({"ok": True, "trans": _translate_chain_blocks([str(t) for t in texts[:40]])})
 
+@app.route("/api/backtranslate", methods=["POST"])
+def api_backtranslate():
+    """回译：把中文核验框里改过的中文 → 地道英文邮件正文，替换回复框。
+    Ivor 英文不强，改中文比改英文顺手——改完一键译回英文再发。"""
+    zh = (request.json or {}).get("text", "").strip()
+    if not zh:
+        return jsonify({"ok": False, "error": "no text"})
+    prompt = ("把下面这段中文改写成自然、礼貌、地道的英文邮件正文，"
+              "完整保留原意和语气，不要遗漏要点、不要自行增减内容，"
+              "只输出英文正文本身，不要任何解释、不要 markdown、不要代码块：\n\n" + zh[:3000])
+    try:
+        en, _eng = _llm_compose(prompt, engine="deepseek", timeout=90)
+        en = (en or "").strip()
+        if not en:
+            return jsonify({"ok": False, "error": "翻译为空"})
+        return jsonify({"ok": True, "text": en})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 @app.route("/api/translate-chain/<message_id>")
 def api_translate_chain(message_id):
     """原生双语：返回该邮件引用链逐块的中文译文（与 chain 等长，已预热则瞬时）。"""
@@ -1487,12 +1614,29 @@ _COLLAB_PLAYBOOK = (
     "跑通后会生成一个 bloome.im/join/... 分享链接——这个链接就是要放进 README 的那个。\n"
     "- CTA 链接必须用对方自建 agent 的 join 分享链接，绝不要用 ref 链接 / 邀请码 / 官网裸链。\n"
     "- README 里除了链接，还要放上我会随邮件附上的官方图片——要提醒对方一起放上去。\n"
-    "- 价格谈定后的标准下一步：给出上述搭建指引 + 提醒带上附件里的官方图片 + 索要收款信息"
-    "（海外用 PayPal 邮箱；走支付宝的要：真实姓名、手机号、居住省市、支付宝收款二维码）。\n"
+    "- 价格谈定后的标准下一步：给出上述搭建指引 + 提醒带上附件里的官方图片 + 索要收款信息。\n"
+    "- 进入付款/收款环节时：请对方填写收款信息表单（链接见配置；方便我们统一收集收款信息）；"
+    "对方也可直接给 PayPal 收款邮箱 / 银行信息。走支付宝的要：真实姓名、手机号、居住省市、收款二维码。\n"
     "- 若对方问「怎么配置 / 有没有教程」：用纯文本数字编号把搭建步骤一步步写清楚"
     "（注册登录 → 新建 agent → 把仓库链接粘贴给它学习 → 试跑一下 → 获取 bloome.im/join 分享链接 → 替换进 README 并附上官方图片）。\n"
     "- 上线后请对方把仓库链接发回确认，确认无误再付款。\n"
 )
+
+# 固定链接（从配置读，不进可编辑 playbook，避免被用户自定义 prompt 覆盖；落地阶段始终注入）。
+# 未配置对应 env（REPLYFLOW_BRIEF_URL / REPLYFLOW_PAYMENT_FORM_URL）时该行省略，整块可能为空字符串。
+def _build_canonical_links() -> str:
+    brief = _cfg("BRIEF_URL")
+    form  = _cfg("PAYMENT_FORM_URL")
+    lines = []
+    if brief:
+        lines.append("- 产品介绍 / brief（请对方先看、了解合作）：" + brief)
+    if form:
+        lines.append("- 收款信息表单（进入付款/收款环节时发给对方填写收款信息）：" + form)
+    if not lines:
+        return ""
+    return "【固定链接 —— 按场景带上，URL 原样粘贴、不要改写或省略】\n" + "\n".join(lines) + "\n"
+
+_CANONICAL_LINKS = _build_canonical_links()
 
 # ── 可后台编辑的提示词（存 vault 外文件，改完即时生效，不动代码）─────────────────
 PROMPTS_FILE = APP_DATA_DIR / "prompts.json"
@@ -1561,7 +1705,7 @@ def _build_reply_prompt(email, seq, last_full, note, lang, instruction, short, i
         + f"双方往来邮件（时间正序；「我」=Ivor 方，「对方」={email}）：\n{seq}\n\n"
         + (f"对方最新一封完整原文（含引用链，可还原谈判过程）：\n{last_full}\n\n" if last_full else "")
         + (f"内部备注：{note}\n\n" if note else "")
-        + (P["playbook"] + "\n" if is_collab else "")
+        + (P["playbook"] + "\n" + _CANONICAL_LINKS + "\n" if is_collab else "")
         + (f"我的指示：{instruction}\n\n" if instruction else "我的指示：根据上下文，写出最合适的下一步回复\n\n")
         + "要求（必须全部遵守）：\n" + P["rules"] + "\n"
         + short_rule
@@ -1692,6 +1836,21 @@ def api_payment_draft():
     reason   = (f"{platform} KOL合作付款" + (f" {amt_txt}/{period}" if amt_txt else "")).strip()
     if res_link:
         reason += "\n" + res_link
+    # 发票护栏：扫这位博主全部往来的附件，看是否真的收到了发票（别盲填"发票见附件"）
+    inv_atts = []
+    try:
+        for p in _dialog_messages_all(email, cached_only=True):
+            for a in (p.get("atts") or []):
+                fn = (a.get("filename") or "").lower()
+                ct = (a.get("content_type") or "").lower()
+                if "pdf" in ct or fn.endswith(".pdf") or "invoice" in fn \
+                        or "发票" in fn or "receipt" in fn or "账单" in fn:
+                    inv_atts.append(a.get("filename") or "附件")
+    except Exception:
+        pass
+    invoice_ok = bool(inv_atts)
+    has_invoice = ("是（见附件：" + "、".join(inv_atts[:3]) + "）") if invoice_ok \
+        else "否——往来里没发现发票附件，付款前先向对方索取"
     return jsonify({"ok": True, "draft": {
         "urgent": "否（默认每周三付款）",
         "due_date": datetime.now().strftime("%Y-%m-%d"),
@@ -1703,7 +1862,8 @@ def api_payment_draft():
         "amount": amount,
         "currency": currency,
         "payee": payee,
-        "has_invoice": "是（发票见附件）",
+        "has_invoice": has_invoice,
+        "invoice_ok": invoice_ok,
         "resource_link": res_link,
     }})
 
@@ -2481,6 +2641,55 @@ def get_status_options(force=False):
 def status_option_names():
     return [o["name"] for o in get_status_options()]
 
+# ── 标签（multi_select）：可在档案卡就地编辑，选项以飞书该字段为准 ──────────────────
+_TAG_FIELD_NAME = "标签"
+_tag_field_id = {"id": "fld91KxfiE"}   # 默认；按字段名查到后更新（字段重建 id 会变、名字不变）
+_tag_opts = {"list": None, "ts": 0}    # 缓存 [{name,color}]
+
+def _resolve_tag_field_id():
+    try:
+        r = _run_json(f"lark-cli base +field-list "
+                      f"--base-token {BASE_TOKEN} --table-id {TABLE_ID} --as user")
+        for f in (((r or {}).get("data") or {}).get("fields") or []):   # field-list 返回 data.fields
+            if (f.get("field_name") or f.get("name")) == _TAG_FIELD_NAME:
+                fid = f.get("field_id") or f.get("id")
+                if fid:
+                    _tag_field_id["id"] = fid
+                    break
+    except Exception:
+        pass
+    return _tag_field_id["id"]
+
+def get_tag_options(force=False):
+    """飞书「标签」字段(multi_select)的真实选项，**按 name 去重**（该字段有同名重复选项，
+    不去重多选下拉会出现两个一样的 pill），缓存 10 分钟。"""
+    now = time.time()
+    if not force and _tag_opts["list"] and now - _tag_opts["ts"] < 600:
+        return _tag_opts["list"]
+    out, seen = [], set()
+    try:
+        fid = _resolve_tag_field_id()
+        if fid:
+            r = _run_json(f"lark-cli base +field-search-options "
+                          f"--base-token {BASE_TOKEN} --table-id {TABLE_ID} "
+                          f"--field-id {fid} --as user")
+            for o in (((r or {}).get("data") or {}).get("options") or []):
+                nm = (o.get("name") or "").strip()
+                if nm and nm not in seen:
+                    seen.add(nm)
+                    out.append({"name": nm, "color": _HUE_CSS.get(o.get("hue"), "#8a8f99")})
+    except Exception:
+        out = []
+    if out:
+        _tag_opts.update(list=out, ts=now)
+    return _tag_opts["list"] or []
+
+def tag_option_names():
+    return [o["name"] for o in get_tag_options()]
+
+def update_feishu_tags(rid: str, names: list) -> bool:
+    return _feishu_patch(rid, {_TAG_FIELD_NAME: names})   # multi_select 写 names 数组
+
 FEISHU_STATUS_OPTIONS = _STATUS_FALLBACK   # 兼容旧引用（仅回退默认；实际校验/渲染走动态选项）
 
 @app.route("/api/feishu-update", methods=["POST"])
@@ -2494,14 +2703,18 @@ def api_feishu_update():
         return jsonify({"ok": False, "error": "未匹配到飞书记录"})
     # 同步更新 my_records 缓存里这条（联系状态分组的 base_only 行靠它反映新状态/计数）
     myrec = next((r for r in (_cache.get("my_records") or []) if r.get("_record_id") == rid), None)
+    # 写回路由：X 来源 → X 表的「当前状态」/「备注」；主表来源 → 默认
+    _rt = _route_of(item) if item else _route_of({})
+    is_x = bool(item and item.get("src") == "x")
     cur_status = (item.get("feishu_status", "") if item else "") or (myrec.get("联系状态", "") if myrec else "")
     cur_note   = (item.get("note", "") if item else "") or (myrec.get("备注（报价、合作形式等）", "") if myrec else "")
     if "status" in data:
         st = str(data["status"]).strip()
-        if st not in status_option_names():
+        # X 表的「当前状态」选项与主表不完全一致；主表来源仍按主表选项校验，X 来源放行交由飞书校验（写不存在选项会返回失败）
+        if not is_x and st not in status_option_names():
             return jsonify({"ok": False, "error": "未知状态选项"})
-        if not update_feishu_status(rid, st):
-            return jsonify({"ok": False, "error": "写入飞书失败"})
+        if not update_feishu_status(rid, st, _rt["status_field"], _rt["base"], _rt["table"]):
+            return jsonify({"ok": False, "error": "写入飞书失败（该状态选项可能在此表不存在）"})
         cur_status = st
         if item:
             item["feishu_status"] = st
@@ -2521,12 +2734,37 @@ def api_feishu_update():
             myrec["联系状态"] = '["%s"]' % st
     if "note" in data:
         nt = str(data["note"]).strip()
-        if not update_feishu_note(rid, nt):
+        if not update_feishu_note(rid, nt, _rt["note_field"], _rt["base"], _rt["table"]):
             return jsonify({"ok": False, "error": "备注写入失败"})
         cur_note = nt
         if item: item["note"] = nt
         if myrec is not None: myrec["备注（报价、合作形式等）"] = nt
-    return jsonify({"ok": True, "feishu_status": cur_status, "note": cur_note})
+    cur_tags = (item.get("feishu", {}) or {}).get("tags") if item else None
+    if "tags" in data:
+        if is_x:   # X 红人池的标签字段/选项与主表不同，且本 UI 加载的是主表选项——不在此改，避免误写
+            return jsonify({"ok": False, "error": "X 红人池请在飞书表里改标签（字段与主表不同）"})
+        valid = set(tag_option_names())
+        tags = [t for t in (data["tags"] if isinstance(data["tags"], list) else []) if t in valid]
+        if not update_feishu_tags(rid, tags):
+            return jsonify({"ok": False, "error": "标签写入失败"})
+        cur_tags = " / ".join(tags)
+        if item and item.get("feishu"): item["feishu"]["tags"] = cur_tags
+        if myrec is not None: myrec["标签"] = json.dumps(tags, ensure_ascii=False)
+    cur_price = (item.get("feishu", {}) or {}).get("price") if item else None
+    if "price" in data:
+        if is_x:   # X 红人池没有「最终成交价」单字段（有 Post/Thread/Quote 单价），不在此写
+            return jsonify({"ok": False, "error": "X 红人池没有「最终成交价」字段，请在 X 表记单价"})
+        raw = str(data["price"]).strip()
+        try:
+            val = float(raw) if raw not in ("", None) else None   # 空 = 清空
+        except Exception:
+            return jsonify({"ok": False, "error": "成交价需是数字"})
+        if not _feishu_patch(rid, {"最终成交价": val}):
+            return jsonify({"ok": False, "error": "成交价写入失败"})
+        cur_price = "" if val is None else (str(int(val)) if val == int(val) else str(val))
+        if item and item.get("feishu"): item["feishu"]["price"] = cur_price
+        if myrec is not None: myrec["最终成交价"] = val
+    return jsonify({"ok": True, "feishu_status": cur_status, "note": cur_note, "tags": cur_tags, "price": cur_price})
 
 @app.route("/api/mark", methods=["POST"])
 def api_mark():
@@ -2538,14 +2776,15 @@ def api_mark():
     if not item:
         return jsonify({"ok": False, "error": "not found"})
     feishu_ok = True
+    _rt = _route_of(item)   # X 来源 → 写回 X 表「当前状态」（"不合适"/"沟通中"选项两表都有）
     if action == "not_suitable":
         set_not_suitable(item["email"], True)   # 粘性：后续来信也保持不合适
         if item.get("record_id"):
-            feishu_ok = update_feishu_status(item["record_id"], "不合适")
+            feishu_ok = update_feishu_status(item["record_id"], "不合适", _rt["status_field"], _rt["base"], _rt["table"])
     elif action == "pending":
         set_not_suitable(item["email"], False)  # 撤销不合适，恢复可处理
         if item.get("action") == "not_suitable" and item.get("record_id"):
-            feishu_ok = update_feishu_status(item["record_id"], "沟通中")
+            feishu_ok = update_feishu_status(item["record_id"], "沟通中", _rt["status_field"], _rt["base"], _rt["table"])
     mark_state(message_id, item["email"], action if action != "pending" else "")
     # 不回 / 不合适：把该博主在飞书的全部未读来信都标已读（不止当前这封）
     if action in ("ignored", "not_suitable"):
@@ -2725,6 +2964,14 @@ body.resizing{user-select:none;cursor:col-resize}
 .f-card{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 12px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;font-size:11.5px;color:var(--text-2);flex-shrink:0}
 .f-chip{display:inline-flex;align-items:center;gap:5px;padding:2.5px 9px;border-radius:99px;background:var(--bg-2);border:1px solid var(--border);white-space:nowrap}
 .f-chip b{color:var(--text);font-weight:600}
+/* 标签就地编辑 */
+.f-tags{flex-wrap:wrap;gap:5px}
+.f-tag{display:inline-flex;align-items:center;gap:3px;padding:1px 4px 1px 8px;border-radius:99px;background:color-mix(in srgb,var(--accent) 14%,var(--card));border:1px solid color-mix(in srgb,var(--accent) 30%,var(--border));font-size:11px;color:var(--text)}
+.f-tag-x{cursor:pointer;color:var(--text-3);font-size:13px;line-height:1;padding:0 3px;border-radius:99px}
+.f-tag-x:hover{color:var(--c-red);background:color-mix(in srgb,var(--c-red) 14%,transparent)}
+.f-tag-add{font-size:11px;color:var(--text-2);background:var(--card);border:1px dashed var(--border);border-radius:99px;padding:1px 6px;cursor:pointer;max-width:120px}
+.rf-toast{position:fixed;right:18px;bottom:18px;z-index:120;background:var(--ink);color:var(--bg);font-size:12.5px;padding:9px 14px;border-radius:10px;box-shadow:0 4px 16px var(--shd);opacity:0;transform:translateY(8px);transition:all .2s;pointer-events:none;max-width:320px}
+.rf-toast.show{opacity:1;transform:translateY(0)}
 .f-chip .k{color:var(--text-3)}
 .f-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .f-note{flex-basis:100%;color:var(--text-2);white-space:pre-wrap;word-break:break-word;margin-top:2px}
@@ -2767,7 +3014,12 @@ body.resizing{user-select:none;cursor:col-resize}
 .att{display:inline-flex;align-items:center;gap:6px;max-width:240px;padding:5px 10px;background:var(--bg-2);border:1px solid var(--border);border-radius:8px;font-size:11.5px;color:var(--text);text-decoration:none;transition:border-color .15s}
 .att:hover{border-color:var(--accent);color:var(--accent)}
 .att .fn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#p-edit-trans{display:none;margin-top:8px;padding:9px 13px;background:var(--input-bg);border:1px dashed var(--border-2);border-radius:10px;font-size:12.2px;color:var(--text-2);line-height:1.65;white-space:pre-wrap;max-height:11vh;overflow-y:auto}
+#p-edit-trans{display:none;margin-top:8px;padding:8px 11px;background:var(--input-bg);border:1px dashed var(--border-2);border-radius:10px}
+.trans-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.trans-label{font-size:11.5px;color:var(--text-3);font-weight:600}
+.trans-back{margin-left:auto;flex-shrink:0}
+.trans-edit{width:100%;box-sizing:border-box;background:transparent;border:none;resize:none;outline:none;font-family:inherit;font-size:12.6px;color:var(--text-2);line-height:1.7;min-height:2.6em;max-height:14vh;overflow-y:auto;padding:0}
+.trans-edit::placeholder{color:var(--text-3);opacity:.7}
 /* AI 回复打分小框 */
 .rate-bar{display:none;align-items:center;gap:8px;margin-top:6px;font-size:11.5px;color:var(--text-3);flex-wrap:wrap}
 .rate-bar.show{display:flex}
@@ -2795,6 +3047,9 @@ body.resizing{user-select:none;cursor:col-resize}
 .modal-tab{padding:5px 12px;border-radius:8px;font-size:12.5px;cursor:pointer;color:var(--text-2)}
 .modal-tab.active{background:var(--accent);color:var(--on-accent);font-weight:600}
 .modal-body{overflow-y:auto;padding:14px 16px}
+.pay-guard{margin:0 0 14px;padding:9px 12px;border-radius:9px;font-size:12px;line-height:1.55}
+.pay-guard.ok{background:color-mix(in srgb,var(--c-green) 12%,transparent);color:var(--text-2);border:1px solid color-mix(in srgb,var(--c-green) 35%,transparent)}
+.pay-guard.warn{background:color-mix(in srgb,var(--c-amber) 16%,transparent);color:var(--text);border:1px solid color-mix(in srgb,var(--c-amber) 45%,transparent)}
 .pf-field{margin-bottom:14px}
 .pf-field label{display:block;font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:5px}
 .pf-field textarea{width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:9px;padding:9px 12px;font-size:12px;color:var(--text);line-height:1.6;resize:vertical;box-sizing:border-box;outline:none;font-family:inherit}
@@ -2871,7 +3126,7 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
 .review-dock{border-left:2px solid var(--ink);}
 .rate-bar.show{border:2px solid var(--ink);border-radius:8px;box-shadow:2px 2px 0 var(--shd);}
 /* 输入框 */
-.p-edit,.eng-sel,#p-edit-trans{border:2px solid var(--ink)!important;border-radius:8px;}
+.p-edit,.eng-sel{border:2px solid var(--ink)!important;border-radius:8px;}
 .p-edit:focus{box-shadow:2px 2px 0 var(--accent);}
 /* 按钮：厚边 + 硬投影 + 按下位移 */
 .btn,.t-btn,.icon-btn{border:2px solid var(--ink)!important;border-radius:8px;box-shadow:2px 2px 0 var(--shd);transition:transform .08s,box-shadow .08s;font-weight:700;}
@@ -2924,6 +3179,7 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
     <div class="sb-sec">智能分组</div>
     <div class="sb-item" onclick="setFilter(this,'reviewing')" title="飞书状态=需审核：已提交内部/领导审核，正在等结果，此时不用回对方。领导审完把状态改掉后，对方未回的会自动回到「待处理」">⏳ 审核中<span class="cnt" id="c-reviewing"></span></div>
     <div class="sb-item" onclick="setFilter(this,'round2')" title="我回过、对方又回我了的待处理邮件——全选后用 AI 批量生成（可配批量指示），逐人按完整往来定制">🔁 二轮待回<span class="cnt" id="c-round2"></span></div>
+    <div class="sb-item" onclick="setFilter(this,'script')" title="对方把脚本/大纲/初稿发回来等我审阅确认制作方向的——点开用「🎬 审脚本」生成审阅清单">🎬 待审脚本<span class="cnt" id="c-script"></span></div>
     <div class="sb-item" onclick="setFilter(this,'coop')" title="飞书联系状态 = 达成合作 / 推进制作">🤝 已合作<span class="cnt" id="c-coop"></span></div>
     <div class="sb-item" onclick="setFilter(this,'followup')" title="我回完之后，对方满 24 小时没动静的——点开后用「⏰ 跟进」快捷指令生成提醒（注：对方回了等我处理的在「待处理」）">⏰ 待跟进<span class="cnt" id="c-followup"></span></div>
     <div class="sb-item" onclick="setFilter(this,'farewell')" title="飞书表里被标 不合适/无法合作、但不是我自己在工具里标的（≈领导判定）、且还没发告别信的——勾选后用「告别批量」按对方语种生成礼貌收尾。我自己标的不合适不进这里">👋 待告别<span class="cnt" id="c-farewell"></span></div>
@@ -2980,6 +3236,18 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
   <button id="batch-btn" style="display:none"></button>
 </div>
 
+<div class="funnel" id="funnel" title="主线漏斗：飞书全表（我名下）各阶段人数，点一段筛该阶段">
+  <div class="fn-seg" onclick="setFilter(this,'st_contacted')"><span class="fn-n" id="fn-contacted">0</span><span class="fn-l">已联系</span></div>
+  <span class="fn-arr">→</span>
+  <div class="fn-seg" onclick="setFilter(this,'st_talking')"><span class="fn-n" id="fn-talking">0</span><span class="fn-l">沟通中</span></div>
+  <span class="fn-arr">→</span>
+  <div class="fn-seg" onclick="setFilter(this,'st_deal')"><span class="fn-n" id="fn-deal">0</span><span class="fn-l">达成合作</span></div>
+  <span class="fn-arr">→</span>
+  <div class="fn-seg good" onclick="setFilter(this,'st_online')"><span class="fn-n" id="fn-online">0</span><span class="fn-l">已上线</span></div>
+  <span class="fn-sep"></span>
+  <div class="fn-seg warn" onclick="setFilter(this,'followup')" title="我方最后发言、对方超 24h 没回——可发轻提醒"><span class="fn-n" id="fn-followup">0</span><span class="fn-l">⏰ 待跟进</span></div>
+</div>
+
 <div class="split">
   <div class="maillist" id="maillist"></div>
   <div class="resizer" id="resizer"></div>
@@ -3029,6 +3297,8 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
           <button class="t-btn" onclick="quickInstr('婉拒这次合作，保持友好，留下以后合作的可能')">🙏 婉拒</button>
           <button class="t-btn" onclick="quickInstr('询问对方：制作一个 7–12 分钟的 YouTube 长视频评测，报价是多少')">❓ 问价</button>
           <button class="t-btn" onclick="quickInstr('帮我跟进这次合作的进展：写一封轻量友好的跟进，补充一个具体的下一步，不重复之前说过的话、不催促不施压')">⏰ 跟进</button>
+          <button class="t-btn" onclick="quickInstr('进入付款环节：请对方填写收款信息表单（链接见配置）以便安排付款，说明支持的付款方式，填写时有任何问题随时联系。语气友好简洁。')">💰 收款</button>
+          <button class="t-btn" onclick="quickInstr('审阅对方发来的脚本/大纲并给出建设性反馈：先肯定整体方向是否OK；逐条指出必带项——产品介绍要清楚、CTA 必须用我们的 bloome.im/join 分享链接（不是邀请码或裸链）、Bloome 拼写与官方口径正确；鼓励用真实产品演示。语气友好。')">🎬 审脚本</button>
         </div>
         <div class="chat-tools chat-tools2">
           <button class="t-btn" onclick="openPayment()" title="AI 从对话预填付款申请，照着去飞书「运营推广付款申请」提交">💰 付款申请</button>
@@ -3049,7 +3319,15 @@ body{font-family:"Helvetica Neue",-apple-system,BlinkMacSystemFont,"PingFang SC"
             <button class="btn btn-send" id="p-approve" onclick="approveSend()" title="把框里的内容直接发出（⌘+Enter）">🚀 发送</button>
           </div>
         </div>
-        <div id="p-edit-trans"></div>
+        <div id="p-edit-trans">
+          <div class="trans-head">
+            <span class="trans-label">🇨🇳 中文核验 · 看不懂英文就改这里</span>
+            <button class="t-btn trans-back" id="trans-back-btn" onclick="backtranslate()"
+              title="把你改好的中文译回地道英文、替换上面的回复框，再发送">↩ 回译成英文</button>
+          </div>
+          <textarea id="p-trans-edit" class="trans-edit" oninput="autoGrowTrans(this)"
+            placeholder="生成英文稿后这里出现中文译文；直接在这里改中文，点「回译成英文」就替换上面的正文。"></textarea>
+        </div>
         <div id="p-status" style="font-size:11.5px;color:var(--text-2);margin-top:5px"></div>
         <div class="rate-bar" id="rate-bar">
           <span>这条 AI 稿质量：</span>
@@ -3166,10 +3444,12 @@ applyTheme(new URLSearchParams(location.search).get('theme') || localStorage.get
 let allItems = [], currentFilter = 'all';
 let _OWNER = '';           // 我的飞书名（负责人），来自 /api/replies（多人版按此过滤/归属）
 let STATUS_OPTIONS = [];   // 联系状态选项 [{name,color}]，来自飞书该字段（/api/replies 灌入）
+let TAG_OPTIONS = [];      // 标签选项（multi_select，已去重），来自飞书该字段（/api/replies 灌入）
 function statusColorOf(name){ const o=STATUS_OPTIONS.find(x=>x.name===name); return o&&o.color; }
 let _selMid = '';
 let _type='', _lang='en';
 let _selected = new Set();
+let _listOrder = [], _lastSelIdx = -1;   // shift 连选：当前列表顺序 + 上次勾选的行号
 const TYPE_LABELS = {readme:'📦 README 合作', direct_ad:'📢 直接广告', pricing:'💰 询价', generic:'💬 通用'};
 const ACTION_TXT  = {sent:'已发送', drafted:'草稿待发', replied:'已回复', not_suitable:'不合适', ignored:'已忽略'};
 
@@ -3184,6 +3464,7 @@ async function loadReplies(force=false){
     allItems = d.items||[];
     if(d.owner!==undefined) _OWNER = d.owner||'';
     if(d.status_options && d.status_options.length) STATUS_OPTIONS = d.status_options;
+    if(d.tag_options && d.tag_options.length) TAG_OPTIONS = d.tag_options;
     _myStatusCounts = d.my_status_counts || _myStatusCounts;
   _myPlatformCounts = d.my_platform_counts || _myPlatformCounts;
     updateStats(d.stats||{});
@@ -3241,6 +3522,7 @@ function updateStats(s){
   set('c-followup',allItems.filter(i=>i.followup).length);
   set('c-reviewing',allItems.filter(isReviewing).length);
   set('c-round2', allItems.filter(i=>needsReply(i) && i.round2).length);
+  set('c-script', allItems.filter(i=>(i.intent||{}).label==='交付').length);
 }
 function calcStats(){
   return {total:allItems.length,
@@ -3320,6 +3602,7 @@ function filteredItems(){
   else if(f==='followup') items=items.filter(i=>i.followup);
   else if(f==='reviewing')items=items.filter(isReviewing);
   else if(f==='round2')   items=items.filter(i=>needsReply(i) && i.round2);
+  else if(f==='script')   items=items.filter(i=>(i.intent||{}).label==='交付');
   const q = (document.getElementById('search')?.value||'').trim().toLowerCase();
   if(q){
     const useContent = (_contentQ===q);   // 后端内容命中只在 query 一致时采用，避免输入过程中串味
@@ -3341,7 +3624,7 @@ function filteredItems(){
   if(f==='all'){
     items = [...items].sort((a,b)=>(b.date||'').localeCompare(a.date||''));
   } else {
-    const W={'同意':0,'报价':1,'提问':2,'待回应':3,'寒暄':4,'拒绝':5};
+    const W={'交付':0,'同意':1,'报价':2,'提问':3,'待回应':4,'寒暄':5,'拒绝':6};
     items = [...items].sort((a,b)=>{
       const ap=a.action?1:0, bp=b.action?1:0;
       if(ap!==bp) return ap-bp;
@@ -3358,6 +3641,7 @@ function intentBadge(it){
   const i=it.intent;
   if(!i || !i.label || it.action) return '';
   const map={'同意':['var(--c-green)','🟢 同意'],
+             '交付':['var(--c-green)','🎬 待审脚本'],
              '报价':['var(--c-amber)','💰 '+(i.price||'报价')],
              '提问':['var(--c-blue)','❓ 提问'],
              '拒绝':['var(--c-red)','🔴 拒绝'],
@@ -3531,15 +3815,36 @@ async function toggleListTrans(){
   renderList();
 }
 
+function relTime(s){
+  if(!s) return '';
+  const d=new Date(String(s).replace(' ','T'));
+  if(isNaN(d)) return String(s).slice(5);
+  const now=new Date(), diff=(now-d)/1000;
+  if(diff<60) return '刚刚';
+  if(diff<3600) return Math.floor(diff/60)+'分钟前';
+  if(d.toDateString()===now.toDateString()) return String(s).slice(11,16);
+  const y=new Date(now); y.setDate(y.getDate()-1);
+  if(d.toDateString()===y.toDateString()) return '昨天'+String(s).slice(11,16);
+  if(d.getFullYear()===now.getFullYear()) return String(s).slice(5,10);
+  return String(s).slice(0,10);
+}
 function renderList(){
   const items = filteredItems();
   const el = document.getElementById('maillist');
-  if(!items.length){ el.innerHTML='<p class="empty">📭 当前筛选无邮件</p>'; return; }
+  if(!items.length){   // 空态按筛选分流：搜空 / 待处理清空 / 分组空，文案不同，免得以为没同步
+    const q=(document.getElementById('search')?.value||'').trim();
+    let msg='📭 该分组暂无博主';
+    if(q) msg='🔍 没有匹配「'+escHTML(q)+'」的邮件 · <a href="#" onclick="clearSearch();return false" style="color:var(--accent)">清除搜索</a>';
+    else if(currentFilter==='pending') msg='🎉 待处理已清空';
+    else if(currentFilter==='all') msg='📭 近 10 天暂无往来';
+    el.innerHTML='<p class="empty">'+msg+'</p>'; return;
+  }
+  _listOrder = items.map(i=>i.message_id);   // shift 连选用的可见顺序
   el.innerHTML = items.map(item=>{
     if(item.base_only) return baseRowHTML(item);   // 没邮件往来的博主用 CRM 行
     const showUnread = item.unread && !item.action;
     const senderName = escHTML((item.from_raw||'').split('<')[0].trim() || item.email);
-    const checkbox = `<input type="checkbox" ${_selected.has(item.message_id)?'checked':''} onclick="event.stopPropagation()" onchange="toggleSelect('${item.message_id}',this.checked)">`;
+    const checkbox = `<input type="checkbox" ${_selected.has(item.message_id)?'checked':''} onclick="rowCheck(event,'${item.message_id}',this.checked)">`;
     const cls = ['mrow',
       item.message_id===_selMid?'sel':'',
       showUnread?'is-unread':'',
@@ -3554,7 +3859,7 @@ function renderList(){
     <div class="mrow-1">
       ${showUnread?'<span class="dot"></span>':''}
       <span class="mname">${senderName}</span>
-      <span class="mtime">${item.date.slice(5)}</span>
+      <span class="mtime" title="${escHTML(item.date||'')}">${relTime(item.date)}</span>
     </div>
     <div class="mrow-3">${ib}${actionBadge(item.action)} ${platformBadge(item.platform,item.matched)}${cp}${fw}</div>
     <div class="msub">${escHTML(item.snippet||item.subject||'')}</div>${(_listTransOn&&_listTrans[item.message_id])?`<div class="msub-zh">🌐 ${escHTML(_listTrans[item.message_id])}</div>`:''}
@@ -3647,12 +3952,13 @@ async function openItem(mid){
         inc.textContent = d.body || '（空）';
         document.getElementById('p-date').textContent = d.date||'';
       }
+      // 只在读取成功后才清未读——失败照清会把这封静默并入已读堆、漏看真实回复
+      if(item.unread){ item.unread=false; updateStats(calcStats()); renderList(); }
     } else {
-      document.getElementById('p-incoming').textContent='读取失败';
+      document.getElementById('p-incoming').innerHTML='<span style="color:var(--text-3)">读取失败 · <a href="#" onclick="openItem(\''+mid+'\');return false" style="color:var(--accent)">重试</a></span>';
     }
-    if(item.unread){ item.unread=false; updateStats(calcStats()); renderList(); }
   }catch(e){
-    document.getElementById('p-incoming').textContent='读取失败';
+    document.getElementById('p-incoming').innerHTML='<span style="color:var(--text-3)">读取失败 · <a href="#" onclick="openItem(\''+mid+'\');return false" style="color:var(--accent)">重试</a></span>';
   }
 }
 function openItemHeaderRefresh(item){
@@ -3715,7 +4021,17 @@ function renderFCard(item){
     chips.push(`<span class="f-chip"><span class="f-dot" style="background:${fStatusColor(f.status)}"></span><span class="k">状态</span>`
       + `<select class="f-status-sel" onchange="fcardStatus('${item.message_id}', this)" title="直接改飞书表的联系状态">${opts}</select>`
       + `${f.updated?`<span class="k">${escHTML(f.updated.slice(5))}</span>`:''}</span>`);
-    if(f.tags)    chips.push(`<span class="f-chip"><span class="k">标签</span><b>${escHTML(f.tags)}</b></span>`);
+    {  // 标签：可就地编辑——已选 pill（点 × 移除）+ 「＋加标签」下拉（写回飞书 multi_select）
+      const cur = (f.tags||'').split(' / ').map(s=>s.trim()).filter(Boolean);
+      const pills = cur.map(t=>`<span class="f-tag">${escHTML(t)}<span class="f-tag-x" title="移除" onclick="event.stopPropagation();fcardRmTag('${item.message_id}','${escHTML(t)}')">×</span></span>`).join('');
+      const left = (TAG_OPTIONS||[]).map(o=>o.name).filter(n=>!cur.includes(n));
+      const add = left.length?`<select class="f-tag-add" onchange="fcardAddTag('${item.message_id}',this)"><option value="">＋ 加标签</option>${left.map(n=>`<option value="${escHTML(n)}">${escHTML(n)}</option>`).join('')}</select>`:'';
+      chips.push(`<span class="f-chip f-tags"><span class="k">标签</span>${pills||'<span style="color:var(--text-3)">无</span>'}${add}</span>`);
+    }
+    {  // 成交价：点击就地编辑 number 字段，写回飞书「最终成交价」——付款/上线/周报优先读它
+      const pv = (f.price||'').trim();
+      chips.push(`<span class="f-chip" title="点击编辑成交价（写回飞书）" style="cursor:pointer" onclick="fcardPriceEdit('${item.message_id}')"><span class="k">成交价</span>${pv?('<b>'+escHTML(pv)+'</b>'):'<span style="color:var(--text-3)">点击填</span>'}</span>`);
+    }
     if(f.coop)    chips.push(`<span class="f-chip"><span class="k">合作</span>${escHTML(f.coop)}</span>`);
     if(f.lang)    chips.push(`<span class="f-chip"><span class="k">语种</span>${escHTML(f.lang)}</span>`);
     if(f.country) chips.push(`<span class="f-chip"><span class="k">国家</span>${escHTML(f.country)}</span>`);
@@ -3788,6 +4104,50 @@ function fcardNoteEdit(mid){
   }
 }
 function fcardNoteCancel(){ _noteEditing=''; _noteDraft=null; renderFCard(curItem()); }
+// 非阻塞提示（右下角，2.5s 自动消）——替代 alert，就地编辑失败回滚时用
+let _toastTimer=null;
+function toast(msg){
+  let t=document.getElementById('rf-toast');
+  if(!t){ t=document.createElement('div'); t.id='rf-toast'; t.className='rf-toast'; document.body.appendChild(t); }
+  t.textContent=msg; t.classList.add('show');
+  clearTimeout(_toastTimer); _toastTimer=setTimeout(()=>t.classList.remove('show'), 2500);
+}
+// 标签就地编辑：乐观更新 → 写回飞书 multi_select → 失败回滚 + toast（不阻塞）
+async function _saveTags(mid, tags, prev){
+  const it=curItem(); if(!it||it.message_id!==mid||!it.feishu) return;
+  it.feishu.tags = tags.join(' / ');            // 乐观更新
+  renderFCard(it);
+  try{
+    const d=await(await fetch('/api/feishu-update',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message_id:mid, record_id:it.record_id, tags})})).json();
+    if(!d.ok){ it.feishu.tags=(prev||[]).join(' / '); if(_selMid===mid)renderFCard(it); toast('❌ 标签未保存：'+(d.error||'')); }
+  }catch(e){ it.feishu.tags=(prev||[]).join(' / '); if(_selMid===mid)renderFCard(it); toast('❌ 网络错误，标签未保存'); }
+}
+function _curTags(it){ return ((it.feishu||{}).tags||'').split(' / ').map(s=>s.trim()).filter(Boolean); }
+function fcardAddTag(mid, sel){
+  const it=curItem(); if(!it) return; const v=sel.value; sel.value='';
+  const cur=_curTags(it); if(!v||cur.includes(v)) return;
+  _saveTags(mid, cur.concat(v), cur.slice());
+}
+function fcardRmTag(mid, tag){
+  const it=curItem(); if(!it) return; const cur=_curTags(it);
+  _saveTags(mid, cur.filter(t=>t!==tag), cur.slice());
+}
+// 成交价就地编辑：写回飞书「最终成交价」number 字段（乐观更新+回滚+toast）
+function fcardPriceEdit(mid){
+  const it=curItem(); if(!it||it.message_id!==mid||!it.feishu) return;
+  const cur=(it.feishu.price||'').trim();
+  const v=prompt('成交价（数字，可留空清除）：', cur);
+  if(v===null) return;
+  const val=v.trim();
+  if(val && isNaN(Number(val))){ toast('成交价需是数字'); return; }
+  const prev=it.feishu.price;
+  it.feishu.price=val; renderFCard(it);   // 乐观
+  fetch('/api/feishu-update',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message_id:mid, record_id:it.record_id, price:val})})
+    .then(r=>r.json()).then(d=>{ if(d.ok){ it.feishu.price=(d.price||''); } else { it.feishu.price=prev; toast('❌ 成交价未保存：'+(d.error||'')); } if(_selMid===mid) renderFCard(it); })
+    .catch(()=>{ it.feishu.price=prev; if(_selMid===mid)renderFCard(it); toast('❌ 网络错误，成交价未保存'); });
+}
 // 未入库博主一键入库：从对话抓候选频道URL → 确认 → 飞书建记录 → 本地变可编辑
 async function addToBase(mid){
   const it = curItem(); if(!it || it.message_id!==mid) return;
@@ -3855,7 +4215,9 @@ function resetReplyBox(){
   t.value = ''; t.style.height = '';
   _lastDraft = '';
   const tr = document.getElementById('p-edit-trans');
-  tr.style.display='none'; tr.textContent='';
+  tr.style.display='none';
+  const tae = document.getElementById('p-trans-edit');
+  if(tae){ tae.value=''; tae.style.height=''; tae.disabled=false; }
   clearReplyImgs();
   hideRate();
 }
@@ -3937,21 +4299,50 @@ async function saveRate(){
   hideRate();
 }
 async function translateReply(text){
-  // 生成的英文回复 → 中文核验译文（哈希缓存，重复内容秒回）
+  // 生成的英文回复 → 中文核验译文（哈希缓存，重复内容秒回）；可直接改、再回译
   const box = document.getElementById('p-edit-trans');
-  box.style.display='block'; box.textContent='🇨🇳 译文生成中...';
+  const ta  = document.getElementById('p-trans-edit');
+  box.style.display='block'; ta.value='译文生成中…'; ta.disabled=true; autoGrowTrans(ta);
   try{
     const r = await fetch('/api/translate-texts',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({texts:[text]})});
     const d = await r.json();
     const tr = d.ok && d.trans && d.trans[0];
-    if(tr) box.textContent = '🇨🇳 ' + tr;
-    else box.style.display='none';
-  }catch(e){ box.style.display='none'; }
+    if(tr){ ta.value = tr; ta.disabled=false; autoGrowTrans(ta); }
+    else { box.style.display='none'; ta.disabled=false; }   // 稿子本身是中文：无需核验
+  }catch(e){ box.style.display='none'; ta.disabled=false; }
+}
+function autoGrowTrans(el){
+  el.style.height='auto';
+  el.style.height = Math.min(el.scrollHeight + 2, window.innerHeight*0.14) + 'px';
+}
+async function backtranslate(){
+  // 改完中文 → 回译成地道英文，替换回复框（Ivor 改中文比改英文顺手）
+  const ta = document.getElementById('p-trans-edit');
+  const zh = (ta.value||'').trim();
+  if(!zh){ toast('中文核验框是空的'); return; }
+  const btn = document.getElementById('trans-back-btn');
+  const old = btn.textContent; btn.disabled=true; btn.textContent='回译中…';
+  try{
+    const r = await fetch('/api/backtranslate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:zh})});
+    const d = await r.json();
+    if(d.ok && d.text){
+      const ed=document.getElementById('p-edit');
+      ed.value=d.text; fitReply(); saveDraft();
+      toast('✅ 已回译成英文并替换正文');
+    } else { toast('❌ 回译失败：'+(d.error||'')); }
+  }catch(e){ toast('❌ 网络错误'); }
+  finally{ btn.disabled=false; btn.textContent=old; }
 }
 function quickInstr(t){
-  document.getElementById('p-edit').value = t;   // 指示进同一个框（微信式）
-  composeReply();
+  // 两段式：点按钮只填指令进框并聚焦，不立刻烧一轮 AI——你可补一句（如"只砍到120"/具体金额）
+  // 再点「生成」或按 g 出稿；省得每次先等 3s 出稿才发现要改、再重来。
+  const ed=document.getElementById('p-edit');
+  ed.value=t; ed.focus();
+  try{ ed.setSelectionRange(t.length, t.length); }catch(e){}
+  if(typeof fitReply==='function') fitReply();
+  toast('已填入指令，可补充/修改后点「生成」（或按 g）');
 }
 let _lastDraft = '';   // 上次生成的英文稿（用于区分"框里是指示"还是"框里是稿"）
 async function composeReply(){
@@ -4066,7 +4457,9 @@ async function _commitSend(payload){
             if(_pendingItems.length){ loadPendingDraft(_pendingItems[0].message_id); }
             else if(here()){ _reviewMid=''; closeReview(); resetReplyBox(); }
           });
-        } else ui(()=>{ status.textContent='🚀 已发送！'; btn.disabled=false; btn.textContent='🚀 发送'; resetReplyBox(); openItem(mid); });
+        } else ui(()=>{ status.textContent='🚀 已发送！'; btn.disabled=false; btn.textContent='🚀 发送'; resetReplyBox();
+            // 发完自动落下一封（清单一气呵成）；没有下一封就停留在原邮件。可在设置关
+            if(localStorage.getItem('rf-autonext')!=='off' && navList(1)) {} else openItem(mid); });
       } else if(job.status==='drafted'){
         applyResult(mid,'drafted',job.draft_url||'');
         ui(()=>{
@@ -4115,6 +4508,21 @@ async function doMark(mid, action){
 /* ── 批量 ── */
 function toggleSelect(mid, checked){
   if(checked) _selected.add(mid); else _selected.delete(mid);
+  updateBatchBtn();
+}
+function rowCheck(ev, mid, checked){
+  // 复选框点击：普通=单选；按住 Shift=从上次勾选处到这里整段连选（批量审核提速）
+  ev.stopPropagation();   // 别触发整行的打开
+  const idx = _listOrder.indexOf(mid);
+  if(ev.shiftKey && _lastSelIdx>=0 && idx>=0){
+    const a=Math.min(_lastSelIdx,idx), b=Math.max(_lastSelIdx,idx);
+    for(let k=a;k<=b;k++){ const id=_listOrder[k];
+      if(id){ if(checked) _selected.add(id); else _selected.delete(id); } }
+    renderList();
+  } else {
+    if(checked) _selected.add(mid); else _selected.delete(mid);
+  }
+  _lastSelIdx = idx;
   updateBatchBtn();
 }
 function selectAllPending(){
@@ -4391,7 +4799,11 @@ async function openPayment(){
 }
 function renderPayment(){
   const body=document.getElementById('payment-body');
-  body.innerHTML=PAY_FIELDS.map(([k,label])=>{
+  // 护栏横幅：发票抬头铁律 + 没收到发票时高亮提醒（付款前置条件）
+  let guard='<div class="pay-guard ok">🧾 发票抬头必须是 <b>__INVOICE_ENTITY__</b>——对方写错就让改了重发</div>';
+  if(_payDraft && _payDraft.invoice_ok===false)
+    guard='<div class="pay-guard warn">⚠️ 往来里没发现发票附件——付款前先向对方索取发票（抬头须为 <b>__INVOICE_ENTITY__</b>）</div>';
+  body.innerHTML=guard+PAY_FIELDS.map(([k,label])=>{
     const v=_payDraft[k]||'';
     if(k==='reason')
       return `<div class="pf-field"><label>${label}</label><textarea id="pay-${k}" rows="3" oninput="_payDraft['${k}']=this.value">${escHTML(v)}</textarea></div>`;
@@ -4432,9 +4844,16 @@ async function openGolive(){
     renderGolive();
   }catch(e){ body.innerHTML='<div style="padding:26px;color:var(--c-red)">网络错误</div>'; }
 }
+function glGuardHTML(){
+  // 上线校验提醒：CTA 必须是博主自建 join 链接 + 上线链接（证据）不能空
+  let h='<div class="pay-guard ok">🔗 CTA 应是博主<b>自建的 bloome.im/join/… 分享链接</b>，不是邀请码（BLOOMENOW）或官网裸链</div>';
+  if(!(_golive.golive_link||'').trim())
+    h+='<div class="pay-guard warn">⚠️ 还没填「上线链接」——写入前先贴上博主已发布内容的 URL 作为证据</div>';
+  return h;
+}
 function renderGolive(){
   const opts=(arr,v)=>arr.map(o=>`<option value="${escHTML(o)}" ${o===v?'selected':''}>${escHTML(o)}</option>`).join('');
-  document.getElementById('golive-body').innerHTML=GOLIVE_FIELDS.map(([k,label,t])=>{
+  document.getElementById('golive-body').innerHTML=glGuardHTML()+GOLIVE_FIELDS.map(([k,label,t])=>{
     const v=_golive[k]||'';
     let input;
     if(t==='sel:ch') input=`<select id="gl-${k}" onchange="_golive['${k}']=this.value" style="width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font-size:12.5px;color:var(--text)">${opts(GOLIVE_CHANNELS,v)}</select>`;
@@ -4537,12 +4956,13 @@ document.addEventListener('click', e=>{
 
 /* ── 键盘流：j/k 上下封 · r 回复 · g 生成 · / 搜索 · Esc 关闭/失焦 · ? 帮助（输入时不触发） ── */
 function navList(dir){
-  const items=filteredItems(); if(!items.length) return;
+  const items=filteredItems(); if(!items.length) return false;
   let idx=items.findIndex(i=>i.message_id===_selMid);
   if(idx<0) idx = dir>0 ? -1 : items.length;
   let n=Math.min(Math.max(idx+dir,0),items.length-1);
   const it=items[n];
-  if(it){ openItem(it.message_id); setTimeout(()=>{const row=document.querySelector('.mrow.sel'); if(row) row.scrollIntoView({block:'nearest'});},60); }
+  if(it && it.message_id!==_selMid){ openItem(it.message_id); setTimeout(()=>{const row=document.querySelector('.mrow.sel'); if(row) row.scrollIntoView({block:'nearest'});},60); return true; }
+  return false;
 }
 document.addEventListener('keydown', e=>{
   const el=document.activeElement, tag=(el&&el.tagName||'').toLowerCase();
@@ -4579,7 +4999,9 @@ def favicon():
 
 @app.route("/")
 def index():
-    resp = app.make_response(HTML)
+    # 发票抬头主体从配置注入（绝不硬编码真实公司名）；未配置则用通用占位
+    html = HTML.replace("__INVOICE_ENTITY__", _cfg("INVOICE_ENTITY", "（公司开票主体）"))
+    resp = app.make_response(html)
     resp.headers["Cache-Control"] = "no-store"   # 禁缓存：改版后普通刷新即生效
     return resp
 
